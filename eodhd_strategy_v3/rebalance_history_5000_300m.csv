@@ -1,0 +1,3 @@
+run_id,target_date,ranked_input,output,macro_regime,top_n_positions,max_position_weight,sector_cap,selected_count,retained_previous_count,turnover_estimate,avg_rank,median_rank
+2026-03-23T12:40:49Z,2026-03-17,ranked_stocks_5000_300m.csv,target_portfolio_5000_300m.csv,,20,0.08,0.25,20,0,1.0,14.25,11.5
+2026-03-23T13:24:12Z,2026-03-17,ranked_stocks_5000_300m.csv,target_portfolio_5000_300m.csv,,50,0.2,0.5,50,0,1.0,28.86,26.5

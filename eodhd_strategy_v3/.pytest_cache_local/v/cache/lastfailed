@@ -1,0 +1,4 @@
+{
+  "tests/test_run_rank.py::test_write_currency_filtered_outputs_writes_only_matching_rows": true,
+  "tests/test_run_rank.py::test_strip_inactive_ranked_output_columns_hides_momentum_fields_when_disabled": true
+}

@@ -1,0 +1,8 @@
+.pytest_tmp/
+.pytest_tmp_base*/
+__pycache__/
+*.py[cod]
+.env
+.venv/
+.idea/
+.vscode/
