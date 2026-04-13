@@ -1,4 +1,7 @@
 {
   "tests/test_run_rank.py::test_write_currency_filtered_outputs_writes_only_matching_rows": true,
-  "tests/test_run_rank.py::test_strip_inactive_ranked_output_columns_hides_momentum_fields_when_disabled": true
+  "tests/test_run_rank.py::test_strip_inactive_ranked_output_columns_hides_momentum_fields_when_disabled": true,
+  "tests/test_run_rank.py::test_news_overlay_helpers_auto_enable_news_events_for_dependent_subfeatures": true,
+  "tests/test_run_rank.py::test_stage1_core_config_disables_non_core_overlays": true,
+  "tests/test_run_rank.py::test_fetch_core_symbol_keeps_analysis_resolution_defaults_after_successful_primary_merge": true
 }

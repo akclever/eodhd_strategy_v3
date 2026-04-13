@@ -184,7 +184,7 @@ def _fundamentals_for_intangible_adjustments() -> dict:
 def test_add_overlay_metrics_prefers_analysis_symbol(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
-    def fake_pead(client, symbol, *args):
+    def fake_pead(client, symbol, *args, **kwargs):
         calls.append(("pead", symbol))
         return {"earnings_surprise_pct": 5.0, "earnings_report_date": "2026-03-01", "pead_signal_calendar": 0.25}
 
@@ -200,7 +200,7 @@ def test_add_overlay_metrics_prefers_analysis_symbol(monkeypatch) -> None:
             "sentiment_latest_count": 2.0,
         }
 
-    def fake_news(client, symbol, *args):
+    def fake_news(client, symbol, *args, **kwargs):
         calls.append(("news", symbol))
         return {
             "news_event_signal": 0.3,
@@ -318,6 +318,71 @@ def test_compute_fundamental_metrics_wires_investment_and_accrual_quality_when_e
     assert metrics["investment_restraint_has_coverage"] > 0
     assert metrics["accrual_quality_signal"] is not None
     assert metrics["accrual_quality_has_coverage"] > 0
+
+
+def test_compute_fundamental_metrics_wires_quality_acceleration_when_enabled() -> None:
+    fundamentals = _fundamentals_for_intangible_adjustments()
+    fundamentals["Financials"]["Balance_Sheet"]["yearly"]["2023-12-31"] = {
+        "date": "2023-12-31",
+        "totalAssets": 1390.0,
+        "totalCurrentLiabilities": 232.0,
+        "totalStockholderEquity": 630.0,
+        "longTermDebt": 212.0,
+        "netReceivables": 150.0,
+        "inventory": 0.0,
+        "commonStockSharesOutstanding": 10.9,
+    }
+    fundamentals["Financials"]["Cash_Flow"]["yearly"]["2023-12-31"] = {
+        "date": "2023-12-31",
+        "totalCashFromOperatingActivities": 118.0,
+        "capitalExpenditures": -26.0,
+    }
+    fundamentals["Financials"]["Balance_Sheet"]["yearly"]["2025-12-31"]["netReceivables"] = 175.0
+    fundamentals["Financials"]["Balance_Sheet"]["yearly"]["2025-12-31"]["inventory"] = 0.0
+    fundamentals["Financials"]["Balance_Sheet"]["yearly"]["2024-12-31"]["netReceivables"] = 162.0
+    fundamentals["Financials"]["Balance_Sheet"]["yearly"]["2024-12-31"]["inventory"] = 0.0
+
+    metrics = compute_fundamental_metrics(
+        object(),
+        "ACME.US",
+        fundamentals,
+        "forward",
+        _config(use_quality_acceleration=True),
+    )
+
+    assert metrics["quality_acceleration_signal"] is not None
+    assert metrics["quality_acceleration_has_coverage"] > 0
+
+
+def test_compute_fundamental_metrics_wires_revision_jerk_when_enabled() -> None:
+    fundamentals = _fundamentals_for_intangible_adjustments()
+    fundamentals["Earnings"] = {
+        "Trend": {
+            "2025-12-31": {
+                "date": "2025-12-31",
+                "earningsEstimateAvg": 1.00,
+                "earningsEstimateNumberOfAnalysts": 6,
+                "epsTrendCurrent": 1.18,
+                "epsTrend7daysAgo": 1.06,
+                "epsTrend30daysAgo": 0.97,
+                "epsRevisionsUpLast7days": 4,
+                "epsRevisionsDownLast30days": 1,
+                "earningsEstimateHigh": 1.24,
+                "earningsEstimateLow": 0.98,
+            }
+        }
+    }
+
+    metrics = compute_fundamental_metrics(
+        object(),
+        "ACME.US",
+        fundamentals,
+        "forward",
+        _config(use_revision_jerk=True),
+    )
+
+    assert metrics["revision_jerk_signal"] is not None
+    assert metrics["revision_jerk_has_coverage"] == 1.0
 
 
 def test_news_theme_drift_and_insider_metrics_stay_neutral_without_coverage() -> None:

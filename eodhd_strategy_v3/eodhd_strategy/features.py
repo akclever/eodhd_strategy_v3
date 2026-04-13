@@ -21,6 +21,7 @@ from .advanced_factors import (
     compute_price_momentum_proxy_metrics,
     compute_pead_signal_from_surprise,
     compute_piotroski_f_score,
+    compute_quality_acceleration_metrics_from_fundamentals,
     compute_recovery_fundamental_metrics,
     compute_revenue_growth_metrics_from_fundamentals,
     compute_revision_impulse_metrics_from_fundamentals,
@@ -422,16 +423,26 @@ def _canonical_news_title(article: Dict[str, Any]) -> str:
     return " ".join(compact)
 
 
-def compute_news_event_metrics(client: EODHDClient, symbol: str, lookback_days: int) -> Dict[str, Optional[float]]:
+def compute_news_event_metrics(
+    client: EODHDClient,
+    symbol: str,
+    lookback_days: int,
+    alpha_factor_spec: str = "legacy",
+) -> Dict[str, Optional[float]]:
     empty_result = {
         "news_event_signal": None,
         "news_event_breadth": 0.0,
         "news_article_count_recent": 0.0,
+        "news_baseline_signal": 0.0,
+        "news_baseline_article_count": 0.0,
+        "news_article_volume_spike": 0.0,
         "news_positive_article_share": 0.0,
         "news_negative_article_share": 0.0,
         "news_unique_title_ratio": 0.0,
         "news_novelty_score": 0.0,
         "news_saturation_score": 0.0,
+        "news_shock_signal": None,
+        "news_shock_has_coverage": 0.0,
         "news_fetch_status": "empty",
         "news_fetch_error": 0.0,
         "news_fetch_error_type": None,
@@ -439,8 +450,10 @@ def compute_news_event_metrics(client: EODHDClient, symbol: str, lookback_days: 
 
     as_of = utc_today_ts()
     end_date = as_of.strftime("%Y-%m-%d")
-    start_date = (as_of - pd.Timedelta(days=max(int(lookback_days), 3))).strftime("%Y-%m-%d")
-    limit = max(20, min(100, int(lookback_days) * 6))
+    recent_window_days = max(3, int(lookback_days))
+    baseline_window_days = max(30, recent_window_days * 3)
+    start_date = (as_of - pd.Timedelta(days=baseline_window_days)).strftime("%Y-%m-%d")
+    limit = max(40, min(250, int(baseline_window_days) * 6))
 
     try:
         payload = client.get_news(symbol=symbol, start_date=start_date, end_date=end_date, limit=limit)
@@ -455,10 +468,13 @@ def compute_news_event_metrics(client: EODHDClient, symbol: str, lookback_days: 
     if not isinstance(payload, list) or not payload:
         return empty_result
 
-    rows = []
+    use_v2 = str(alpha_factor_spec).lower() == "v2"
+    recent_rows = []
+    baseline_rows = []
     matched_categories_all: set[str] = set()
     canonical_titles: List[str] = []
-    half_life_days = max(3.0, float(lookback_days) / 2.0)
+    recent_half_life_days = max(2.0, float(recent_window_days) / (3.0 if use_v2 else 2.0))
+    baseline_half_life_days = max(float(recent_window_days), float(baseline_window_days - recent_window_days) / 2.0)
 
     for article in payload:
         if not isinstance(article, dict):
@@ -492,21 +508,35 @@ def compute_news_event_metrics(client: EODHDClient, symbol: str, lookback_days: 
         relevance_weight = 1.0 / np.sqrt(float(max(1, symbol_count)))
 
         age_days = max(0.0, float((as_of - published_at.normalize()).days))
-        recency_weight = float(np.exp(-np.log(2.0) * age_days / half_life_days))
-        article_weight = max(1e-6, relevance_weight * recency_weight)
+        if age_days > float(baseline_window_days):
+            continue
 
-        rows.append(
-            {
-                "signal": article_signal,
-                "weight": article_weight,
-                "direction": float(np.sign(article_signal)),
-            }
-        )
+        if age_days <= float(recent_window_days):
+            if canonical_title:
+                canonical_titles.append(canonical_title)
+            matched_categories_all.update(categories)
+            recency_weight = float(np.exp(-np.log(2.0) * age_days / recent_half_life_days))
+            recent_rows.append(
+                {
+                    "signal": article_signal,
+                    "weight": max(1e-6, relevance_weight * recency_weight),
+                    "direction": float(np.sign(article_signal)),
+                }
+            )
+        else:
+            baseline_age_days = max(0.0, age_days - float(recent_window_days))
+            baseline_weight = float(np.exp(-np.log(2.0) * baseline_age_days / baseline_half_life_days))
+            baseline_rows.append(
+                {
+                    "signal": article_signal,
+                    "weight": max(1e-6, relevance_weight * baseline_weight),
+                }
+            )
 
-    if not rows:
+    if not recent_rows:
         return empty_result
 
-    news_df = pd.DataFrame(rows)
+    news_df = pd.DataFrame(recent_rows)
     total_weight = float(news_df["weight"].sum())
     if total_weight <= 0:
         return empty_result
@@ -520,18 +550,52 @@ def compute_news_event_metrics(client: EODHDClient, symbol: str, lookback_days: 
     category_diversity = float(min(1.0, len(matched_categories_all) / 3.0))
     novelty_score = float(np.clip(0.65 * unique_title_ratio + 0.35 * category_diversity, 0.0, 1.0))
     direction_concentration = float(abs(news_df["direction"].mean()))
-    article_density = float(min(1.0, article_count / max(3.0, float(lookback_days) / 2.0)))
+    article_density = float(min(1.0, article_count / max(3.0, float(recent_window_days) / 2.0)))
     saturation_score = float(np.clip(article_density * direction_concentration, 0.0, 1.0))
+    baseline_signal = 0.0
+    baseline_count = 0.0
+    article_volume_spike = 0.0
+    news_shock_signal = None
+    news_shock_coverage = 0.0
+    if baseline_rows:
+        baseline_df = pd.DataFrame(baseline_rows)
+        baseline_total_weight = float(baseline_df["weight"].sum())
+        if baseline_total_weight > 0:
+            baseline_signal = float((baseline_df["signal"] * baseline_df["weight"]).sum() / baseline_total_weight)
+        baseline_count = float(len(baseline_df))
+        baseline_span_days = max(1.0, float(baseline_window_days - recent_window_days))
+        expected_recent_articles = max(1.0, baseline_count * float(recent_window_days) / baseline_span_days)
+        article_volume_spike = float(np.clip(article_count / expected_recent_articles, 0.0, 3.0))
+        news_shock_coverage = float(
+            np.clip(
+                0.45 * min(1.0, article_count / 2.0) + 0.55 * min(1.0, baseline_count / 4.0),
+                0.0,
+                1.0,
+            )
+        )
+    else:
+        article_volume_spike = float(np.clip(article_count / max(1.0, float(recent_window_days) / 3.0), 0.0, 3.0))
+        news_shock_coverage = float(np.clip(0.35 * min(1.0, article_count / 3.0), 0.0, 0.35))
+
+    shock_delta = float(np.clip((weighted_signal - baseline_signal) / 0.35, -1.0, 1.0))
+    if article_count > 0:
+        shock_scale = 0.55 + 0.25 * min(1.0, article_volume_spike / 2.0) + 0.20 * novelty_score
+        news_shock_signal = float(np.clip(shock_delta * shock_scale, -1.0, 1.0))
 
     return {
         "news_event_signal": weighted_signal,
         "news_event_breadth": float(len(matched_categories_all)),
         "news_article_count_recent": article_count,
+        "news_baseline_signal": baseline_signal,
+        "news_baseline_article_count": baseline_count,
+        "news_article_volume_spike": article_volume_spike,
         "news_positive_article_share": positive_share,
         "news_negative_article_share": negative_share,
         "news_unique_title_ratio": unique_title_ratio,
         "news_novelty_score": novelty_score,
         "news_saturation_score": saturation_score,
+        "news_shock_signal": news_shock_signal,
+        "news_shock_has_coverage": news_shock_coverage,
         "news_fetch_status": "ok",
         "news_fetch_error": 0.0,
         "news_fetch_error_type": None,
@@ -551,6 +615,8 @@ def compute_news_theme_drift_metrics(
         "news_theme_drift_has_coverage": 0.0,
         "news_theme_drift_recent_intensity": 0.0,
         "news_theme_drift_baseline_intensity": 0.0,
+        "news_theme_drift_recent_article_count": 0.0,
+        "news_theme_drift_baseline_article_count": 0.0,
         "news_theme_drift_fetch_status": "empty",
         "news_theme_drift_fetch_error": 0.0,
         "news_theme_drift_fetch_error_type": None,
@@ -609,8 +675,14 @@ def compute_news_theme_drift_metrics(
         else:
             baseline_scores.append(theme_score * relevance_weight)
 
+    recent_count = float(len(recent_scores))
+    baseline_count = float(len(baseline_scores))
     if not recent_scores or not baseline_scores:
-        return empty_result
+        return {
+            **empty_result,
+            "news_theme_drift_recent_article_count": recent_count,
+            "news_theme_drift_baseline_article_count": baseline_count,
+        }
 
     recent_intensity = float(np.mean(recent_scores))
     baseline_intensity = float(np.mean(baseline_scores))
@@ -619,12 +691,15 @@ def compute_news_theme_drift_metrics(
         novelty_multiplier = 1.0 + 0.20 * min(1.0, len(recent_scores) / 6.0)
         revision_multiplier = 1.0 + 0.25 * float(np.clip(revision_support or 0.0, -1.0, 1.0))
         drift_signal = float(np.clip(drift_signal * novelty_multiplier * revision_multiplier, -1.0, 1.0))
+    coverage = float(np.clip(min(recent_count, baseline_count) / 2.0, 0.0, 1.0))
 
     return {
         "news_theme_drift_signal": drift_signal,
-        "news_theme_drift_has_coverage": 1.0,
+        "news_theme_drift_has_coverage": coverage,
         "news_theme_drift_recent_intensity": recent_intensity,
         "news_theme_drift_baseline_intensity": baseline_intensity,
+        "news_theme_drift_recent_article_count": recent_count,
+        "news_theme_drift_baseline_article_count": baseline_count,
         "news_theme_drift_fetch_status": "ok",
         "news_theme_drift_fetch_error": 0.0,
         "news_theme_drift_fetch_error_type": None,
@@ -660,6 +735,9 @@ def compute_insider_conviction_metrics(
         "insider_conviction_has_coverage": 0.0,
         "insider_conviction_buy_cluster": 0.0,
         "insider_conviction_sell_pressure": 0.0,
+        "insider_conviction_trade_count": 0.0,
+        "insider_conviction_buy_person_count": 0.0,
+        "insider_conviction_sell_person_count": 0.0,
         "insider_fetch_status": "empty",
         "insider_fetch_error": 0.0,
         "insider_fetch_error_type": None,
@@ -687,6 +765,7 @@ def compute_insider_conviction_metrics(
     weighted_sell = 0.0
     buy_people: set[str] = set()
     sell_people: set[str] = set()
+    valid_trade_count = 0
 
     for item in payload:
         if not isinstance(item, dict):
@@ -715,6 +794,7 @@ def compute_insider_conviction_metrics(
         is_sell = code in {"S", "D", "SELL", "DISPOSE"}
         if not is_buy and not is_sell:
             continue
+        valid_trade_count += 1
 
         shares = to_float(item.get("transactionAmount") or item.get("shares") or item.get("shareAmount"))
         price = to_float(item.get("transactionPrice") or item.get("price"))
@@ -722,7 +802,8 @@ def compute_insider_conviction_metrics(
         if price is not None and price > 0:
             base_size *= float(price)
 
-        recency_weight = float(np.exp(-np.log(2.0) * age_days / max(20.0, float(lookback_days) / 2.0)))
+        decay_half_life_days = max(10.0 if use_v2 else 20.0, float(lookback_days) / (3.0 if use_v2 else 2.0))
+        recency_weight = float(np.exp(-np.log(2.0) * age_days / decay_half_life_days))
         role_weight = _insider_role_weight(item, strict=use_v2)
         trade_weight = max(1.0, base_size ** 0.5) * recency_weight * role_weight
         owner = str(item.get("ownerName") or item.get("name") or "").strip().lower()
@@ -741,20 +822,28 @@ def compute_insider_conviction_metrics(
         return empty_result
 
     buy_cluster = float(min(1.0, len(buy_people) / 3.0))
-    buy_strength = float(np.tanh((weighted_buy / max(total_activity, 1.0)) * (1.0 + buy_cluster)))
+    buy_strength = float(np.tanh((weighted_buy / max(total_activity, 1.0)) * (1.10 + 0.90 * buy_cluster)))
     sell_pressure = 0.0
-    if len(sell_people) >= 2 and weighted_sell > 1.25 * max(weighted_buy, 1.0):
-        sell_pressure = float(np.tanh(weighted_sell / max(weighted_buy + 1.0, 1.0)))
+    sell_person_threshold = 3 if use_v2 else 2
+    sell_ratio_threshold = 2.0 if use_v2 else 1.4
+    if len(sell_people) >= sell_person_threshold and weighted_sell > sell_ratio_threshold * max(weighted_buy + 1.0, 1.0):
+        sell_cluster = float(min(1.0, len(sell_people) / 4.0))
+        sell_ratio = weighted_sell / max(weighted_buy + 1.0, 1.0)
+        sell_pressure = float(np.tanh(max(0.0, sell_ratio - sell_ratio_threshold / 2.0)) * sell_cluster)
 
-    signal = float(np.clip(buy_strength - 0.85 * sell_pressure, -1.0, 1.0))
+    signal = float(np.clip(1.05 * buy_strength - 0.55 * sell_pressure, -1.0, 1.0))
     if use_v2:
-        revision_boost = 0.20 * float(np.clip(revision_support or 0.0, -1.0, 1.0))
+        revision_boost = 0.15 * max(0.0, float(np.clip(revision_support or 0.0, -1.0, 1.0)))
         signal = float(np.clip(signal + revision_boost, -1.0, 1.0))
+    coverage = float(np.clip(valid_trade_count / (4.0 if use_v2 else 3.0), 0.0, 1.0))
     return {
         "insider_conviction_signal": signal,
-        "insider_conviction_has_coverage": 1.0,
+        "insider_conviction_has_coverage": coverage,
         "insider_conviction_buy_cluster": buy_cluster,
         "insider_conviction_sell_pressure": sell_pressure,
+        "insider_conviction_trade_count": float(valid_trade_count),
+        "insider_conviction_buy_person_count": float(len(buy_people)),
+        "insider_conviction_sell_person_count": float(len(sell_people)),
         "insider_fetch_status": "ok",
         "insider_fetch_error": 0.0,
         "insider_fetch_error_type": None,
@@ -768,6 +857,7 @@ def compute_pead_metrics_from_calendar(
     half_life_days: int,
     max_abs_surprise_pct: float,
     max_age_days: int,
+    alpha_factor_spec: str = "legacy",
 ) -> Dict[str, Optional[float]]:
     from_date = (utc_today_ts() - pd.Timedelta(days=max(lookback_days * 2, 365))).strftime("%Y-%m-%d")
     to_date = utc_today_ts().strftime("%Y-%m-%d")
@@ -853,9 +943,9 @@ def compute_pead_metrics_from_calendar(
         "pead_signal_calendar": compute_pead_signal_from_surprise(
             earnings_surprise_pct=surprise_pct,
             earnings_report_date=report_date,
-            half_life_days=half_life_days,
+            half_life_days=max(1, int(round(float(half_life_days) * (0.75 if str(alpha_factor_spec).lower() == "v2" else 1.0)))),
             max_abs_surprise_pct=max_abs_surprise_pct,
-            max_age_days=max_age_days,
+            max_age_days=max(5, int(round(float(max_age_days) * (0.85 if str(alpha_factor_spec).lower() == "v2" else 1.0)))),
         ),
     }
 
@@ -1192,6 +1282,11 @@ def compute_fundamental_metrics(
         "revision_impulse_signal": None,
         "revision_impulse_has_coverage": 0.0,
         "revision_impulse_analyst_count": None,
+        "revision_jerk_signal": None,
+        "revision_jerk_has_coverage": 0.0,
+        "revision_jerk_recent_velocity": None,
+        "revision_jerk_prior_velocity": None,
+        "revision_jerk_component": None,
         "revision_impulse_drift_7d": None,
         "revision_impulse_drift_30d": None,
         "revision_impulse_breadth": None,
@@ -1261,6 +1356,15 @@ def compute_fundamental_metrics(
         "accrual_quality_cash_conversion": None,
         "accrual_quality_margin_gap": None,
         "accrual_quality_working_capital_stretch": None,
+        "quality_acceleration_signal": None,
+        "quality_acceleration_has_coverage": 0.0,
+        "quality_acceleration_measure_count": 0.0,
+        "quality_acceleration_margin_delta": None,
+        "quality_acceleration_return_delta": None,
+        "quality_acceleration_turnover_delta": None,
+        "quality_acceleration_cfo_margin_delta": None,
+        "quality_acceleration_working_capital_delta": None,
+        "quality_acceleration_periodicity": None,
         "capital_allocation_quality_signal": None,
         "capital_allocation_quality_has_coverage": 0.0,
         "capital_allocation_buyback_component": None,
@@ -1288,11 +1392,12 @@ def compute_fundamental_metrics(
                 half_life_days=config.pead_half_life_days,
                 max_abs_surprise_pct=config.pead_max_abs_surprise_pct,
                 max_age_days=config.pead_max_age_days,
+                alpha_factor_spec=alpha_factor_spec,
             )
         )
         metrics.update(compute_sue_metrics_from_fundamentals(fundamentals))
 
-    if config.use_revision_impulse:
+    if config.use_revision_impulse or getattr(config, "use_revision_jerk", False):
         metrics.update(
             compute_revision_impulse_metrics_from_fundamentals(
                 fundamentals,
@@ -1382,6 +1487,9 @@ def compute_fundamental_metrics(
     if getattr(config, "use_accrual_quality", False):
         metrics.update(compute_accrual_quality_metrics(fundamentals))
 
+    if getattr(config, "use_quality_acceleration", False):
+        metrics.update(compute_quality_acceleration_metrics_from_fundamentals(fundamentals))
+
     if getattr(config, "use_capital_allocation_quality", False):
         metrics.update(
             compute_capital_allocation_quality_metrics(
@@ -1429,6 +1537,7 @@ def add_overlay_metrics(client: EODHDClient, row: Dict[str, Any], config: Ranker
             config.pead_half_life_days,
             config.pead_max_abs_surprise_pct,
             config.pead_max_age_days,
+            alpha_factor_spec=str(getattr(config, "alpha_factor_spec", "legacy") or "legacy"),
         )
         out["earnings_surprise_pct"] = fallback.get("earnings_surprise_pct")
         out["earnings_report_date"] = fallback.get("earnings_report_date")
@@ -1464,17 +1573,29 @@ def add_overlay_metrics(client: EODHDClient, row: Dict[str, Any], config: Ranker
         out.setdefault("sentiment_fetch_error", 0.0)
         out.setdefault("sentiment_fetch_error_type", None)
 
-    if config.use_news_events:
-        out.update(compute_news_event_metrics(client, symbol, config.news_lookback_days))
+    if config.use_news_events or getattr(config, "use_news_shock", False):
+        out.update(
+            compute_news_event_metrics(
+                client,
+                symbol,
+                config.news_lookback_days,
+                alpha_factor_spec=str(getattr(config, "alpha_factor_spec", "legacy") or "legacy"),
+            )
+        )
     else:
         out.setdefault("news_event_signal", None)
         out.setdefault("news_event_breadth", None)
         out.setdefault("news_article_count_recent", None)
+        out.setdefault("news_baseline_signal", 0.0)
+        out.setdefault("news_baseline_article_count", 0.0)
+        out.setdefault("news_article_volume_spike", 0.0)
         out.setdefault("news_positive_article_share", None)
         out.setdefault("news_negative_article_share", None)
         out.setdefault("news_unique_title_ratio", None)
         out.setdefault("news_novelty_score", None)
         out.setdefault("news_saturation_score", None)
+        out.setdefault("news_shock_signal", None)
+        out.setdefault("news_shock_has_coverage", 0.0)
         out.setdefault("news_fetch_status", "not_requested")
         out.setdefault("news_fetch_error", 0.0)
         out.setdefault("news_fetch_error_type", None)
@@ -1493,6 +1614,8 @@ def add_overlay_metrics(client: EODHDClient, row: Dict[str, Any], config: Ranker
         out.setdefault("news_theme_drift_has_coverage", 0.0)
         out.setdefault("news_theme_drift_recent_intensity", None)
         out.setdefault("news_theme_drift_baseline_intensity", None)
+        out.setdefault("news_theme_drift_recent_article_count", 0.0)
+        out.setdefault("news_theme_drift_baseline_article_count", 0.0)
         out.setdefault("news_theme_drift_fetch_status", "not_requested")
         out.setdefault("news_theme_drift_fetch_error", 0.0)
         out.setdefault("news_theme_drift_fetch_error_type", None)
@@ -1511,6 +1634,9 @@ def add_overlay_metrics(client: EODHDClient, row: Dict[str, Any], config: Ranker
         out.setdefault("insider_conviction_has_coverage", 0.0)
         out.setdefault("insider_conviction_buy_cluster", 0.0)
         out.setdefault("insider_conviction_sell_pressure", 0.0)
+        out.setdefault("insider_conviction_trade_count", 0.0)
+        out.setdefault("insider_conviction_buy_person_count", 0.0)
+        out.setdefault("insider_conviction_sell_person_count", 0.0)
         out.setdefault("insider_fetch_status", "not_requested")
         out.setdefault("insider_fetch_error", 0.0)
         out.setdefault("insider_fetch_error_type", None)

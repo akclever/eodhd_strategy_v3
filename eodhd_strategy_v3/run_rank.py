@@ -5,10 +5,11 @@ import argparse
 import os
 import re
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -19,7 +20,6 @@ from eodhd_strategy.exchanges import (
     infer_listing_region,
     normalize_exchange_code,
     requested_exchange_aliases,
-    symbol_suffix_aliases,
 )
 from eodhd_strategy.features import add_overlay_metrics, compute_fundamental_metrics
 from eodhd_strategy.macro import apply_macro_sector_tilts, infer_macro_decision
@@ -32,6 +32,7 @@ from eodhd_strategy.ranker import (
 )
 from eodhd_strategy.regions import apply_rank_defaults, get_region_preset, region_allows_listing
 from eodhd_strategy.universe import collect_universe, normalize_symbol
+from eodhd_strategy.valuation import DEFAULT_TOP_N as DEFAULT_VALUATION_TOP_N, build_valuation_report
 
 MOMENTUM_OUTPUT_COLUMNS = [
     "price_momentum_1m",
@@ -150,6 +151,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Weight for revision-impulse overlay in composite score",
     )
     parser.add_argument(
+        "--use-revision-jerk",
+        action="store_true",
+        help="Add a short-term revision-jerk overlay that rewards accelerating analyst estimate changes",
+    )
+    parser.add_argument(
+        "--revision-jerk-weight",
+        type=float,
+        default=0.04,
+        help="Weight for revision-jerk overlay in composite score",
+    )
+    parser.add_argument(
         "--use-estimate-term-structure",
         action="store_true",
         help="Add an estimate-term-structure overlay using recent Earnings.Trend persistence and disagreement compression",
@@ -176,6 +188,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.10,
         help="Weight for the revenue growth/acceleration overlay in composite score",
+    )
+    parser.add_argument(
+        "--use-quality-acceleration",
+        action="store_true",
+        help="Add a quality-acceleration overlay rewarding improving margins, returns, cash conversion, and cleaner working-capital trends",
+    )
+    parser.add_argument(
+        "--quality-acceleration-weight",
+        type=float,
+        default=0.05,
+        help="Weight for the quality-acceleration overlay in composite score",
     )
     parser.add_argument(
         "--use-residual-valuation",
@@ -257,6 +280,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.06,
         help="Weight for the experimental structured-news event overlay in composite score",
+    )
+    parser.add_argument(
+        "--use-news-shock",
+        action="store_true",
+        help="Add a short-term news-shock overlay using recent news intensity versus its own baseline and article-volume spikes",
+    )
+    parser.add_argument(
+        "--news-shock-weight",
+        type=float,
+        default=0.04,
+        help="Weight for the short-term news-shock overlay in composite score",
     )
     parser.add_argument(
         "--use-news-peer-spillover",
@@ -406,6 +440,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dividend-payout-cap", type=float, default=0.85)
     parser.add_argument("--max-distance-from-high", type=float, default=0.15)
     parser.add_argument("--require-above-200dma", action="store_true")
+    parser.add_argument(
+        "--core-weight-floor",
+        type=float,
+        default=0.60,
+        help="Minimum stock-level share reserved for the core factor block after optional sleeves are coverage-adjusted",
+    )
 
     parser.add_argument("--neutralize-by", choices=["none", "sector", "industry"], default="sector")
     parser.add_argument("--compare-neutralization", action="store_true")
@@ -458,6 +498,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top", type=int, default=25)
     parser.add_argument("--output", default="ranked_stocks_v3.csv")
     parser.add_argument("--diagnostics-output", default="rank_diagnostics.csv")
+    parser.add_argument(
+        "--valuation-top-n",
+        type=int,
+        default=0,
+        help=(
+            "Generate a separate valuation dashboard for the top N ranked names. "
+            f"Use {DEFAULT_VALUATION_TOP_N} for a typical shortlist, or 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--valuation-output",
+        default="",
+        help="Optional CSV path for the valuation dashboard. Defaults to <output stem>_valuation.csv when valuation is enabled.",
+    )
     parser.add_argument(
         "--currency-list-output",
         action="append",
@@ -521,6 +575,12 @@ def _revision_impulse_compare_output_path(output_path: str) -> Path:
     output = Path(output_path)
     suffix = output.suffix or ".csv"
     return output.with_name(f"{output.stem}_revision_impulse_compare{suffix}")
+
+
+def _valuation_output_path(output_path: str) -> Path:
+    output = Path(output_path)
+    suffix = output.suffix or ".csv"
+    return output.with_name(f"{output.stem}_valuation{suffix}")
 
 
 def _parse_currency_output_specs(raw_values: Sequence[str]) -> list[tuple[str, Path]]:
@@ -849,6 +909,125 @@ def _clone_ranker_config(config: RankerConfig, **overrides: Any) -> RankerConfig
     return replace(config, **overrides)
 
 
+def _make_client(config: RankerConfig) -> EODHDClient:
+    return EODHDClient(
+        api_token=config.api_token,
+        cache_dir=config.cache_dir,
+        refresh=config.refresh,
+    )
+
+
+def _thread_local_client_provider(config: RankerConfig) -> Callable[[], EODHDClient]:
+    local = threading.local()
+
+    def _get_client() -> EODHDClient:
+        client = getattr(local, "client", None)
+        if client is None:
+            client = _make_client(config)
+            local.client = client
+        return client
+
+    return _get_client
+
+
+def _resolve_client(client_or_provider: EODHDClient | Callable[[], EODHDClient]) -> EODHDClient:
+    if callable(client_or_provider):
+        return client_or_provider()
+    return client_or_provider
+
+
+def _news_event_overlay_requested(config: RankerConfig) -> bool:
+    return any(
+        [
+            bool(getattr(config, "use_news_events", False)),
+            bool(getattr(config, "use_news_peer_spillover", False)),
+            bool(getattr(config, "use_news_novelty_saturation", False)),
+            bool(getattr(config, "use_news_confirmation", False)),
+            bool(getattr(config, "use_news_macro_weighting", False)),
+        ]
+    )
+
+
+def _news_overlay_requested(config: RankerConfig) -> bool:
+    return any(
+        [
+            _news_event_overlay_requested(config),
+            bool(getattr(config, "use_news_shock", False)),
+            bool(getattr(config, "use_news_theme_drift", False)),
+        ]
+    )
+
+
+def _stage2_overlay_requested(config: RankerConfig) -> bool:
+    return bool(
+        getattr(config, "use_pead", False)
+        or getattr(config, "use_sentiment", False)
+        or getattr(config, "use_insider_conviction", False)
+        or _news_overlay_requested(config)
+    )
+
+
+def _normalize_overlay_dependencies(config: RankerConfig) -> list[str]:
+    notes: list[str] = []
+    if _news_event_overlay_requested(config) and not bool(getattr(config, "use_news_events", False)):
+        config.use_news_events = True
+        notes.append(
+            "Auto-enabled --use-news-events because a dependent news overlay feature was requested."
+        )
+    return notes
+
+
+def _stage1_core_config(config: RankerConfig) -> RankerConfig:
+    return _clone_ranker_config(
+        config,
+        use_pead=False,
+        use_revision_impulse=False,
+        use_revision_jerk=False,
+        use_estimate_term_structure=False,
+        use_growth_acceleration=False,
+        use_quality_acceleration=False,
+        use_residual_valuation=False,
+        use_compounder_persistence=False,
+        use_intangible_adjustments=False,
+        use_price_momentum=False,
+        use_life_cycle=False,
+        use_sentiment=False,
+        use_news_events=False,
+        use_news_shock=False,
+        use_news_peer_spillover=False,
+        use_news_novelty_saturation=False,
+        use_news_confirmation=False,
+        use_news_macro_weighting=False,
+        use_capital_allocation_quality=False,
+        use_recovery_transition=False,
+        use_insider_conviction=False,
+        use_news_theme_drift=False,
+        use_peer_relative_anomalies=False,
+        use_employee_efficiency=False,
+        use_investment_restraint=False,
+        use_accrual_quality=False,
+    )
+
+
+def _apply_analysis_identity_defaults(
+    metrics: Dict[str, Any],
+    *,
+    listing_symbol: str,
+    analysis_symbol: str,
+) -> Dict[str, Any]:
+    out = dict(metrics)
+    out.setdefault("listing_symbol", listing_symbol)
+    out.setdefault("analysis_symbol", analysis_symbol)
+    out.setdefault("analysis_symbol_source", "listing_symbol")
+    out.setdefault(
+        "analysis_identity_mismatch",
+        float(str(analysis_symbol).upper().strip() != str(listing_symbol or "").upper().strip()),
+    )
+    out.setdefault("analysis_resolution_error", 0.0)
+    out.setdefault("analysis_resolution_error_message", None)
+    return out
+
+
 def _parse_weight_grid(raw_value: str) -> list[float]:
     weights: list[float] = []
     seen: set[float] = set()
@@ -872,7 +1051,7 @@ def _parse_weight_grid(raw_value: str) -> list[float]:
 
 
 def fetch_core_symbol(
-    client: EODHDClient,
+    client: EODHDClient | Callable[[], EODHDClient],
     symbol: str,
     config: RankerConfig,
     region: str,
@@ -881,6 +1060,7 @@ def fetch_core_symbol(
     required_crosslisting_exchanges: set[str] | None = None,
 ) -> Dict[str, Any]:
     try:
+        client = _resolve_client(client)
         fundamentals = client.get_fundamentals(symbol)
         listing_metrics = compute_fundamental_metrics(client, symbol, fundamentals, config.dividend_source, config)
         if strict_issuer_country:
@@ -916,11 +1096,11 @@ def fetch_core_symbol(
             }
 
         analysis_symbol = str(symbol or "").upper().strip()
-        metrics = dict(listing_metrics)
-        metrics.setdefault("analysis_symbol_source", "listing_symbol")
-        metrics.setdefault("analysis_identity_mismatch", 0.0)
-        metrics.setdefault("analysis_resolution_error", 0.0)
-        metrics.setdefault("analysis_resolution_error_message", None)
+        metrics = _apply_analysis_identity_defaults(
+            listing_metrics,
+            listing_symbol=symbol,
+            analysis_symbol=analysis_symbol,
+        )
         if getattr(config, "analysis_from_primary_ticker", False):
             preferred_analysis_symbol = _resolve_analysis_symbol(symbol, listing_metrics, region)
             if preferred_analysis_symbol and preferred_analysis_symbol != analysis_symbol:
@@ -940,13 +1120,24 @@ def fetch_core_symbol(
                         analysis_symbol,
                         analysis_metrics,
                     )
+                    metrics = _apply_analysis_identity_defaults(
+                        metrics,
+                        listing_symbol=symbol,
+                        analysis_symbol=analysis_symbol,
+                    )
                     metrics["analysis_symbol_source"] = "primary_ticker"
                     metrics["analysis_identity_mismatch"] = float(
                         str(analysis_symbol).upper().strip() != str(symbol or "").upper().strip()
                     )
+                    metrics["analysis_resolution_error"] = 0.0
+                    metrics["analysis_resolution_error_message"] = None
                 except Exception as exc:
                     analysis_symbol = str(symbol or "").upper().strip()
-                    metrics = dict(listing_metrics)
+                    metrics = _apply_analysis_identity_defaults(
+                        listing_metrics,
+                        listing_symbol=symbol,
+                        analysis_symbol=analysis_symbol,
+                    )
                     metrics["analysis_symbol_source"] = "listing_symbol"
                     metrics["analysis_identity_mismatch"] = 0.0
                     metrics["analysis_resolution_error"] = 1.0
@@ -999,8 +1190,13 @@ def fetch_core_symbol(
         return {"symbol": symbol, "region": region, "error": str(exc), "error_stage": "fundamentals"}
 
 
-def enrich_overlay_symbol(client: EODHDClient, row: Dict[str, Any], config: RankerConfig) -> Dict[str, Any]:
+def enrich_overlay_symbol(
+    client: EODHDClient | Callable[[], EODHDClient],
+    row: Dict[str, Any],
+    config: RankerConfig,
+) -> Dict[str, Any]:
     try:
+        client = _resolve_client(client)
         return add_overlay_metrics(client, row, config)
     except KeyboardInterrupt:
         raise
@@ -1083,10 +1279,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         use_revision_impulse=bool(args.use_revision_impulse),
         min_revision_analysts=max(1, int(args.min_revision_analysts)),
         revision_impulse_weight=float(args.revision_impulse_weight),
+        use_revision_jerk=bool(args.use_revision_jerk),
+        revision_jerk_weight=float(args.revision_jerk_weight),
         use_estimate_term_structure=bool(args.use_estimate_term_structure),
         estimate_term_structure_weight=float(args.estimate_term_structure_weight),
         use_growth_acceleration=bool(args.use_growth_acceleration),
         growth_weight=float(args.growth_weight),
+        use_quality_acceleration=bool(args.use_quality_acceleration),
+        quality_acceleration_weight=float(args.quality_acceleration_weight),
         alpha_factor_spec=str(args.alpha_factor_spec),
         use_residual_valuation=bool(args.use_residual_valuation),
         use_compounder_persistence=bool(args.use_compounder_persistence),
@@ -1104,6 +1304,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         news_lookback_days=int(args.news_lookback_days),
         min_news_articles=max(1, int(args.min_news_articles)),
         news_event_weight=float(args.news_event_weight),
+        use_news_shock=bool(args.use_news_shock),
+        news_shock_weight=float(args.news_shock_weight),
         use_news_peer_spillover=bool(args.use_news_peer_spillover),
         news_peer_spillover_weight=float(args.news_peer_spillover_weight),
         use_news_novelty_saturation=bool(args.use_news_novelty_saturation),
@@ -1146,12 +1348,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         universe_size=0,
         use_employee_efficiency=bool(args.use_employee_efficiency),
         employee_efficiency_weight=float(args.employee_efficiency_weight),
+        core_weight_floor=float(args.core_weight_floor),
         analysis_from_primary_ticker=bool(args.analysis_from_primary_ticker),
         exclude_special_situations=bool(args.exclude_special_situations),
         price_momentum_source_mode="history_only" if bool(args.require_real_momentum_coverage) else "auto",
     )
 
-    client = EODHDClient(api_token=api_token, cache_dir=config.cache_dir, refresh=config.refresh)
+    dependency_notes = _normalize_overlay_dependencies(config)
+
+    client = _make_client(config)
+    worker_client = _thread_local_client_provider(config)
 
     macro_decision = None
     if args.use_macro:
@@ -1207,13 +1413,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         feed_probe_error = _summarize_exception(exc)
         print(f"Warning: failed to inspect account feed entitlements ({feed_probe_error}).", file=sys.stderr)
 
+    for note in dependency_notes:
+        print(note, file=sys.stderr)
+
     universe = collect_universe(client, args)
     if not universe:
         print("No symbols found for the requested universe.", file=sys.stderr)
         return 1
 
     allowed_listing_exchanges = requested_exchange_aliases(args.exchanges)
-    allowed_listing_exchanges.update(symbol_suffix_aliases(universe))
     if not allowed_listing_exchanges:
         allowed_listing_exchanges = None
     required_crosslisting_exchanges = requested_exchange_aliases(args.require_crosslisting_exchanges)
@@ -1229,7 +1437,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         futures = {
             executor.submit(
                 fetch_core_symbol,
-                client,
+                worker_client,
                 symbol,
                 config,
                 args.region,
@@ -1255,13 +1463,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("All symbols failed during data collection.", file=sys.stderr)
         return 1
 
-    base_cfg = _clone_ranker_config(
-        config,
-        use_pead=False,
-        use_revision_impulse=False,
-        use_sentiment=False,
-        use_news_events=False,
-    )
+    base_cfg = _stage1_core_config(config)
     stage1_rows, provisional, stage1_diagnostics = build_ranked_frame(usable_df, base_cfg)
 
     if provisional.empty:
@@ -1274,19 +1476,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     overlay_inputs = usable_df.to_dict(orient="records")
-    overlay_requested = bool(
-        config.use_pead
-        or config.use_sentiment
-        or config.use_news_events
-        or getattr(config, "use_insider_conviction", False)
-        or getattr(config, "use_news_theme_drift", False)
-    )
+    overlay_requested = _stage2_overlay_requested(config)
     if overlay_requested:
         print(f"Stage 2: overlays for {len(overlay_inputs)} eligible names...", file=sys.stderr)
         enriched_rows: List[Dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=config.workers) as executor:
             futures = {
-                executor.submit(enrich_overlay_symbol, client, row, config): row["symbol"]
+                executor.submit(enrich_overlay_symbol, worker_client, row, config): row["symbol"]
                 for row in overlay_inputs
             }
             for idx, future in enumerate(as_completed(futures), start=1):
@@ -1337,6 +1533,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         ranked["region"] = ranked["region"].fillna(args.region)
     ranked.to_csv(config.output, index=False)
     diagnostics.to_csv(args.diagnostics_output, index=False)
+
+    valuation_output: Path | None = None
+    valuation_rows = pd.DataFrame()
+    if int(args.valuation_top_n) > 0:
+        valuation_output = Path(args.valuation_output) if str(args.valuation_output or "").strip() else _valuation_output_path(
+            args.output
+        )
+        valuation_rows = build_valuation_report(
+            client,
+            ranked,
+            top_n=int(args.valuation_top_n),
+        )
+        valuation_rows.to_csv(valuation_output, index=False)
 
     currency_outputs = _write_currency_filtered_outputs(ranked, currency_output_specs)
 
@@ -1492,6 +1701,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"\nSaved ranked output to {config.output}", file=sys.stderr)
     print(f"Saved diagnostics to {args.diagnostics_output}", file=sys.stderr)
+    if valuation_output is not None:
+        print(
+            f"Saved valuation dashboard ({len(valuation_rows)} rows) to {valuation_output}",
+            file=sys.stderr,
+        )
     for currency_code, output_path, row_count in currency_outputs:
         print(f"Saved {currency_code} list ({row_count} rows) to {output_path}", file=sys.stderr)
     return 0

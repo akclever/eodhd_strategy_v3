@@ -87,6 +87,13 @@ class RankerConfig:
     investment_restraint_weight: float = 0.04
     use_accrual_quality: bool = False
     accrual_quality_weight: float = 0.05
+    use_quality_acceleration: bool = False
+    quality_acceleration_weight: float = 0.05
+    core_weight_floor: float = 0.60
+    use_revision_jerk: bool = False
+    revision_jerk_weight: float = 0.04
+    use_news_shock: bool = False
+    news_shock_weight: float = 0.04
 
 
 @dataclass

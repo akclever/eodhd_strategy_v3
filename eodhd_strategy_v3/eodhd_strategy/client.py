@@ -14,6 +14,7 @@ from urllib3.util.retry import Retry
 
 BASE_URL = 'https://eodhd.com/api'
 USER_AGENT = 'eodhd-smart-ranker/3.0'
+_CACHE_IO_LOCK = threading.RLock()
 
 
 class TokenBucketRateLimiter:
@@ -90,12 +91,13 @@ class EODHDClient:
         params['api_token'] = self.api_token
         params['fmt'] = 'json'
         cache_path = self._cache_path(endpoint, params)
-        if not self.refresh and cache_path.exists():
-            if ttl_hours is None:
-                return json.loads(cache_path.read_text(encoding='utf-8'))
-            age_hours = (time.time() - cache_path.stat().st_mtime) / 3600.0
-            if age_hours <= ttl_hours:
-                return json.loads(cache_path.read_text(encoding='utf-8'))
+        with _CACHE_IO_LOCK:
+            if not self.refresh and cache_path.exists():
+                if ttl_hours is None:
+                    return json.loads(cache_path.read_text(encoding='utf-8'))
+                age_hours = (time.time() - cache_path.stat().st_mtime) / 3600.0
+                if age_hours <= ttl_hours:
+                    return json.loads(cache_path.read_text(encoding='utf-8'))
         self.rate_limiter.consume(max(1, request_cost))
         url = f'{BASE_URL}{endpoint}'
         response = self.session.get(url, params=params, timeout=self.timeout)
@@ -111,7 +113,11 @@ class EODHDClient:
                 raise RuntimeError(f'API errors for {endpoint}: {lower["errors"]}')
             if 'message' in lower and isinstance(lower['message'], str) and 'error' in lower['message'].lower():
                 raise RuntimeError(f'API message for {endpoint}: {lower["message"]}')
-        cache_path.write_text(json.dumps(data), encoding='utf-8')
+        payload = json.dumps(data)
+        tmp_path = cache_path.with_suffix(f'{cache_path.suffix}.tmp')
+        with _CACHE_IO_LOCK:
+            tmp_path.write_text(payload, encoding='utf-8')
+            tmp_path.replace(cache_path)
         return data
 
     def get_user(self) -> Dict[str, Any]:

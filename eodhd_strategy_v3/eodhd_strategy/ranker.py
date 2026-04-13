@@ -80,14 +80,20 @@ def add_factor_zscores(df: pd.DataFrame, config: RankerConfig) -> pd.DataFrame:
         factor_list += ["sue_signal"]
     if getattr(config, "use_revision_impulse", False):
         factor_list += ["revision_impulse_signal"]
+    if getattr(config, "use_revision_jerk", False):
+        factor_list += ["revision_jerk_signal"]
     if getattr(config, "use_estimate_term_structure", False):
         factor_list += ["estimate_term_structure_signal"]
     if getattr(config, "use_growth_acceleration", False):
         factor_list += ["revenue_growth_yoy", "revenue_acceleration"]
+    if getattr(config, "use_quality_acceleration", False):
+        factor_list += ["quality_acceleration_signal"]
     if getattr(config, "use_price_momentum", False):
         factor_list += ["price_momentum_effective_signal"]
     if getattr(config, "use_news_events", False):
         factor_list += ["news_event_effective_signal"]
+    if getattr(config, "use_news_shock", False):
+        factor_list += ["news_shock_signal"]
     if getattr(config, "use_peer_relative_anomalies", False):
         factor_list += ["peer_relative_anomaly_signal"]
     if getattr(config, "use_capital_allocation_quality", False):
@@ -168,10 +174,36 @@ def _depth_scale(series: pd.Series, full_count: float, floor: float = 0.0) -> pd
     return clipped.where(clipped <= 0.0, floor + (1.0 - floor) * clipped)
 
 
+def _normalize_weight_block(
+    relative_weights: dict[str, pd.Series],
+    total_share: pd.Series,
+) -> dict[str, pd.Series]:
+    if not relative_weights:
+        return {}
+
+    frame = pd.DataFrame(
+        {
+            name: pd.to_numeric(series, errors="coerce").fillna(0.0).clip(lower=0.0)
+            for name, series in relative_weights.items()
+        },
+        index=total_share.index,
+    )
+    weight_sum = frame.sum(axis=1).replace(0.0, np.nan)
+    normalized = frame.div(weight_sum, axis=0).fillna(0.0)
+    total = pd.to_numeric(total_share, errors="coerce").fillna(0.0).clip(lower=0.0)
+    return {name: normalized[name] * total for name in frame.columns}
+
+
 def _peer_level_scale(series: pd.Series, mapping: dict[str, float], default: float = 0.0) -> pd.Series:
     labels = series.fillna("").astype(str).str.lower()
     scaled = labels.map({str(key).lower(): float(value) for key, value in mapping.items()})
     return pd.to_numeric(scaled, errors="coerce").fillna(float(default)).clip(lower=0.0)
+
+
+def _risk_excess_scale(series: pd.Series, trigger: float, ceiling: float = 2.0) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    denom = max(1e-9, float(ceiling) - float(trigger))
+    return ((numeric - float(trigger)) / denom).clip(0.0, 1.0)
 
 
 def _winsorize_numeric(series: pd.Series, lower: float = 0.05, upper: float = 0.95) -> pd.Series:
@@ -217,6 +249,43 @@ def _ols_residuals(
     if winsorize and residuals.notna().any():
         residuals.loc[residuals.notna()] = _winsorize_numeric(residuals.dropna()).reindex(residuals.dropna().index)
     return residuals
+
+
+def _residualize_against_predictors(
+    response: pd.Series,
+    predictors: dict[str, pd.Series],
+    *,
+    min_samples: int = 12,
+) -> tuple[pd.Series, float]:
+    response_numeric = pd.to_numeric(response, errors="coerce")
+    frame = pd.DataFrame({"response": response_numeric}, index=response.index)
+    predictor_cols: list[str] = []
+    overlap_values: list[float] = []
+
+    for name, series in predictors.items():
+        predictor_numeric = pd.to_numeric(series, errors="coerce")
+        if predictor_numeric.notna().sum() < 2:
+            continue
+        frame[name] = predictor_numeric
+        predictor_cols.append(name)
+
+        paired = pd.concat([response_numeric, predictor_numeric], axis=1).dropna()
+        if len(paired) >= 3 and paired.iloc[:, 0].nunique(dropna=True) > 1 and paired.iloc[:, 1].nunique(dropna=True) > 1:
+            corr = paired.iloc[:, 0].corr(paired.iloc[:, 1], method="spearman")
+            if pd.notna(corr):
+                overlap_values.append(abs(float(corr)))
+
+    if not predictor_cols:
+        return response_numeric, 0.0
+
+    residuals = _ols_residuals(frame, "response", predictor_cols)
+    if residuals.notna().sum() < max(min_samples, len(predictor_cols) + 4):
+        return response_numeric, max(overlap_values, default=0.0)
+
+    residualized = robust_zscore(residuals).clip(-2.0, 2.0)
+    out = response_numeric.copy()
+    out.loc[residualized.dropna().index] = residualized.dropna()
+    return out, max(overlap_values, default=0.0)
 
 
 def _build_residual_value_signal(eligible: pd.DataFrame, config: RankerConfig) -> pd.DataFrame:
@@ -681,16 +750,19 @@ def _split_core_component_weights(
 ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
     residual_weight = pd.Series(0.0, index=eligible.index, dtype=float)
     compounder_weight = pd.Series(0.0, index=eligible.index, dtype=float)
+    use_v2 = str(getattr(config, "alpha_factor_spec", "legacy") or "legacy").lower() == "v2"
+    residual_share = 0.55 if use_v2 else 0.45
+    compounder_share = 0.25 if use_v2 else 0.30
 
     if getattr(config, "use_residual_valuation", False) and "residual_value_signal" in eligible.columns:
         has_signal = eligible["residual_value_signal"].notna()
-        residual_weight.loc[has_signal] = adjusted_book_weight.loc[has_signal] * 0.45
-        adjusted_book_weight.loc[has_signal] = adjusted_book_weight.loc[has_signal] * 0.55
+        residual_weight.loc[has_signal] = adjusted_book_weight.loc[has_signal] * residual_share
+        adjusted_book_weight.loc[has_signal] = adjusted_book_weight.loc[has_signal] * (1.0 - residual_share)
 
     if getattr(config, "use_compounder_persistence", False) and "compounder_persistence_signal" in eligible.columns:
         has_signal = eligible["compounder_persistence_signal"].notna()
-        compounder_weight.loc[has_signal] = gross_profitability_weight.loc[has_signal] * 0.30
-        gross_profitability_weight.loc[has_signal] = gross_profitability_weight.loc[has_signal] * 0.70
+        compounder_weight.loc[has_signal] = gross_profitability_weight.loc[has_signal] * compounder_share
+        gross_profitability_weight.loc[has_signal] = gross_profitability_weight.loc[has_signal] * (1.0 - compounder_share)
 
     return (
         shareholder_weight,
@@ -811,6 +883,7 @@ def build_diagnostics(
             "pead_has_setup_coverage",
             "sue_has_coverage",
             "revision_impulse_has_coverage",
+            "revision_jerk_has_coverage",
             "estimate_term_structure_has_coverage",
             "revenue_growth_has_coverage",
             "residual_value_has_coverage",
@@ -821,10 +894,12 @@ def build_diagnostics(
             "price_momentum_proxy_used",
             "sentiment_has_coverage",
             "news_has_coverage",
+            "news_shock_has_coverage",
             "capital_allocation_quality_has_coverage",
             "recovery_transition_has_coverage",
             "investment_restraint_has_coverage",
             "accrual_quality_has_coverage",
+            "quality_acceleration_has_coverage",
             "insider_conviction_has_coverage",
             "news_theme_drift_has_coverage",
             "working_capital_stress_has_coverage",
@@ -883,11 +958,13 @@ def build_diagnostics(
                 "sue_signal",
                 "sue_surprise_pct",
                 "revision_impulse_signal",
+                "revision_jerk_signal",
                 "revision_impulse_analyst_count",
                 "revision_impulse_disagreement_penalty",
                 "estimate_term_structure_signal",
                 "estimate_term_structure_record_count",
                 "estimate_term_structure_disagreement_trend",
+                "estimate_term_structure_overlap_penalty",
                 "revenue_growth_yoy",
                 "revenue_acceleration",
                 "residual_value_signal",
@@ -900,8 +977,12 @@ def build_diagnostics(
                 "news_event_effective_signal",
                 "news_event_breadth",
                 "news_article_count_recent",
+                "news_baseline_signal",
+                "news_baseline_article_count",
+                "news_article_volume_spike",
                 "news_novelty_score",
                 "news_saturation_score",
+                "news_shock_signal",
                 "news_peer_spillover_signal",
                 "news_confirmation_signal",
                 "news_macro_multiplier",
@@ -913,6 +994,8 @@ def build_diagnostics(
                 "investment_restraint_measure_count",
                 "accrual_quality_signal",
                 "accrual_quality_measure_count",
+                "quality_acceleration_signal",
+                "quality_acceleration_measure_count",
                 "recovery_margin_inflection",
                 "recovery_leverage_improvement",
                 "recovery_transition_signal",
@@ -928,18 +1011,23 @@ def build_diagnostics(
             [
                 "earnings_signal_confidence",
                 "revision_signal_confidence",
+                "revision_jerk_signal_confidence",
                 "estimate_term_structure_signal_confidence",
                 "growth_signal_confidence",
                 "momentum_signal_confidence",
                 "news_signal_confidence",
+                "news_shock_signal_confidence",
                 "capital_allocation_signal_confidence",
                 "residual_value_signal_confidence",
                 "compounder_persistence_signal_confidence",
                 "recovery_transition_signal_confidence",
                 "investment_restraint_signal_confidence",
                 "accrual_quality_signal_confidence",
+                "quality_acceleration_signal_confidence",
                 "insider_conviction_signal_confidence",
                 "news_theme_drift_signal_confidence",
+                "effective_core_share",
+                "effective_optional_share",
                 "contrib_shareholder_yield",
                 "contrib_gross_profitability",
                 "contrib_adjusted_book_to_market",
@@ -947,14 +1035,17 @@ def build_diagnostics(
                 "contrib_compounder_persistence",
                 "contrib_earnings",
                 "contrib_revision_impulse",
+                "contrib_revision_jerk",
                 "contrib_estimate_term_structure",
                 "contrib_growth",
                 "contrib_momentum",
                 "contrib_news_event",
+                "contrib_news_shock",
                 "contrib_capital_allocation",
                 "contrib_recovery_transition",
                 "contrib_investment_restraint",
                 "contrib_accrual_quality",
+                "contrib_quality_acceleration",
                 "contrib_insider_conviction",
                 "contrib_news_theme_drift",
                 "contrib_employee_efficiency",
@@ -981,7 +1072,9 @@ def build_diagnostics(
                 "pead_signal",
                 "sue_signal",
                 "revision_impulse_signal",
+                "revision_jerk_signal",
                 "estimate_term_structure_signal",
+                "estimate_term_structure_overlap_penalty",
                 "revenue_growth_yoy",
                 "revenue_acceleration",
                 "residual_value_signal",
@@ -1001,6 +1094,8 @@ def build_diagnostics(
                 "investment_restraint_measure_count",
                 "accrual_quality_signal",
                 "accrual_quality_measure_count",
+                "quality_acceleration_signal",
+                "quality_acceleration_measure_count",
                 "recovery_transition_signal",
                 "insider_conviction_signal",
                 "sentiment_article_count_recent",
@@ -1008,8 +1103,12 @@ def build_diagnostics(
                 "news_event_effective_signal",
                 "news_event_breadth",
                 "news_article_count_recent",
+                "news_baseline_signal",
+                "news_baseline_article_count",
+                "news_article_volume_spike",
                 "news_novelty_score",
                 "news_saturation_score",
+                "news_shock_signal",
                 "news_peer_spillover_signal",
                 "news_confirmation_signal",
                 "news_macro_multiplier",
@@ -1024,10 +1123,12 @@ def build_diagnostics(
             [
                 "earnings_signal_confidence",
                 "revision_signal_confidence",
+                "revision_jerk_signal_confidence",
                 "estimate_term_structure_signal_confidence",
                 "growth_signal_confidence",
                 "momentum_signal_confidence",
                 "news_signal_confidence",
+                "news_shock_signal_confidence",
                 "capital_allocation_signal_confidence",
                 "residual_value_signal_confidence",
                 "compounder_persistence_signal_confidence",
@@ -1035,8 +1136,11 @@ def build_diagnostics(
                 "recovery_transition_signal_confidence",
                 "investment_restraint_signal_confidence",
                 "accrual_quality_signal_confidence",
+                "quality_acceleration_signal_confidence",
                 "insider_conviction_signal_confidence",
                 "news_theme_drift_signal_confidence",
+                "effective_core_share",
+                "effective_optional_share",
                 "contrib_shareholder_yield",
                 "contrib_gross_profitability",
                 "contrib_adjusted_book_to_market",
@@ -1045,14 +1149,17 @@ def build_diagnostics(
                 "contrib_peer_relative_anomaly",
                 "contrib_earnings",
                 "contrib_revision_impulse",
+                "contrib_revision_jerk",
                 "contrib_estimate_term_structure",
                 "contrib_growth",
                 "contrib_momentum",
                 "contrib_news_event",
+                "contrib_news_shock",
                 "contrib_capital_allocation",
                 "contrib_recovery_transition",
                 "contrib_investment_restraint",
                 "contrib_accrual_quality",
+                "contrib_quality_acceleration",
                 "contrib_insider_conviction",
                 "contrib_news_theme_drift",
                 "contrib_employee_efficiency",
@@ -1073,14 +1180,17 @@ def build_diagnostics(
                 "contrib_peer_relative_anomaly",
                 "contrib_earnings",
                 "contrib_revision_impulse",
+                "contrib_revision_jerk",
                 "contrib_estimate_term_structure",
                 "contrib_growth",
                 "contrib_momentum",
                 "contrib_news_event",
+                "contrib_news_shock",
                 "contrib_capital_allocation",
                 "contrib_recovery_transition",
                 "contrib_investment_restraint",
                 "contrib_accrual_quality",
+                "contrib_quality_acceleration",
                 "contrib_insider_conviction",
                 "contrib_news_theme_drift",
                 "contrib_forensic",
@@ -1109,12 +1219,15 @@ def _build_forensic_penalty(eligible: pd.DataFrame, config: RankerConfig) -> pd.
         out["z_beneish_risk"] = np.nan
         if "beneish_m_score" in out.columns and out["beneish_m_score"].notna().any():
             out["z_beneish_risk"] = robust_zscore(out["beneish_m_score"]).clip(0.0, 2.0)
+            out["z_beneish_risk"] = _risk_excess_scale(out["z_beneish_risk"], trigger=0.40)
 
         missing_penalty = max(0.0, min(2.0, float(getattr(config, "missing_beneish_penalty", 0.0))))
         if missing_penalty > 0.0 and "beneish_is_missing" in out.columns:
             missing_mask = pd.to_numeric(out["beneish_is_missing"], errors="coerce").fillna(0.0) >= 1.0
             out.loc[missing_mask, "beneish_missing_penalty_applied"] = missing_penalty
-            out.loc[missing_mask & out["z_beneish_risk"].isna(), "z_beneish_risk"] = missing_penalty
+            out.loc[missing_mask & out["z_beneish_risk"].isna(), "z_beneish_risk"] = float(
+                np.clip(missing_penalty / 2.0, 0.0, 1.0)
+            )
 
         risk_components.append(("z_beneish_risk", 1.0))
     else:
@@ -1122,15 +1235,16 @@ def _build_forensic_penalty(eligible: pd.DataFrame, config: RankerConfig) -> pd.
 
     if config.use_accrual_volatility and "accrual_volatility" in out.columns and out["accrual_volatility"].notna().any():
         out["z_accrual_volatility_risk"] = robust_zscore(out["accrual_volatility"]).clip(0.0, 2.0)
-        risk_components.append(("z_accrual_volatility_risk", 0.75))
+        out["z_accrual_volatility_risk"] = _risk_excess_scale(out["z_accrual_volatility_risk"], trigger=0.45)
+        risk_components.append(("z_accrual_volatility_risk", 0.65))
     else:
         out["z_accrual_volatility_risk"] = np.nan
 
     if getattr(config, "use_working_capital_stress", False) and "working_capital_stress_penalty" in out.columns:
         penalty = pd.to_numeric(out["working_capital_stress_penalty"], errors="coerce")
-        out["z_working_capital_stress_risk"] = (penalty.fillna(0.0) / 0.06).clip(0.0, 1.0)
+        out["z_working_capital_stress_risk"] = _risk_excess_scale((penalty.fillna(0.0) / 0.06).clip(0.0, 2.0), trigger=0.30)
         if penalty.notna().any():
-            risk_components.append(("z_working_capital_stress_risk", 0.5))
+            risk_components.append(("z_working_capital_stress_risk", 0.35))
     else:
         out["z_working_capital_stress_risk"] = np.nan
 
@@ -1142,7 +1256,7 @@ def _build_forensic_penalty(eligible: pd.DataFrame, config: RankerConfig) -> pd.
             has_component = component.notna()
             weighted_total = weighted_total + weight * component.fillna(0.0)
             available_weight = available_weight + weight * has_component.astype(float)
-        out["forensic_penalty"] = (weighted_total / available_weight.replace(0.0, np.nan)).clip(0.0, 2.0)
+        out["forensic_penalty"] = (weighted_total / available_weight.replace(0.0, np.nan)).clip(0.0, 1.25)
     else:
         out["forensic_penalty"] = np.nan
 
@@ -1201,6 +1315,11 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "revision_impulse_signal",
         "revision_impulse_has_coverage",
         "revision_impulse_analyst_count",
+        "revision_jerk_signal",
+        "revision_jerk_has_coverage",
+        "revision_jerk_recent_velocity",
+        "revision_jerk_prior_velocity",
+        "revision_jerk_component",
         "revision_impulse_drift_7d",
         "revision_impulse_drift_30d",
         "revision_impulse_breadth",
@@ -1263,11 +1382,16 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "news_event_effective_signal",
         "news_event_breadth",
         "news_article_count_recent",
+        "news_baseline_signal",
+        "news_baseline_article_count",
+        "news_article_volume_spike",
         "news_positive_article_share",
         "news_negative_article_share",
         "news_unique_title_ratio",
         "news_novelty_score",
         "news_saturation_score",
+        "news_shock_signal",
+        "news_shock_has_coverage",
         "news_novelty_multiplier",
         "news_saturation_multiplier",
         "news_peer_spillover_signal",
@@ -1311,6 +1435,15 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "accrual_quality_cash_conversion",
         "accrual_quality_margin_gap",
         "accrual_quality_working_capital_stretch",
+        "quality_acceleration_signal",
+        "quality_acceleration_has_coverage",
+        "quality_acceleration_measure_count",
+        "quality_acceleration_margin_delta",
+        "quality_acceleration_return_delta",
+        "quality_acceleration_turnover_delta",
+        "quality_acceleration_cfo_margin_delta",
+        "quality_acceleration_working_capital_delta",
+        "quality_acceleration_periodicity",
         "capital_allocation_quality_signal",
         "capital_allocation_quality_has_coverage",
         "capital_allocation_buyback_component",
@@ -1327,10 +1460,15 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "insider_conviction_has_coverage",
         "insider_conviction_buy_cluster",
         "insider_conviction_sell_pressure",
+        "insider_conviction_trade_count",
+        "insider_conviction_buy_person_count",
+        "insider_conviction_sell_person_count",
         "news_theme_drift_signal",
         "news_theme_drift_has_coverage",
         "news_theme_drift_recent_intensity",
         "news_theme_drift_baseline_intensity",
+        "news_theme_drift_recent_article_count",
+        "news_theme_drift_baseline_article_count",
         "forensic_penalty",
         "total_revenue",
         "full_time_employees",
@@ -1338,10 +1476,12 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "gross_profit_per_employee",
         "earnings_signal_confidence",
         "revision_signal_confidence",
+        "revision_jerk_signal_confidence",
         "estimate_term_structure_signal_confidence",
         "growth_signal_confidence",
         "momentum_signal_confidence",
         "news_signal_confidence",
+        "news_shock_signal_confidence",
         "capital_allocation_signal_confidence",
         "residual_value_signal_confidence",
         "compounder_persistence_signal_confidence",
@@ -1349,8 +1489,11 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "recovery_transition_signal_confidence",
         "investment_restraint_signal_confidence",
         "accrual_quality_signal_confidence",
+        "quality_acceleration_signal_confidence",
         "insider_conviction_signal_confidence",
         "news_theme_drift_signal_confidence",
+        "effective_core_share",
+        "effective_optional_share",
         "contrib_shareholder_yield",
         "contrib_gross_profitability",
         "contrib_adjusted_book_to_market",
@@ -1359,18 +1502,22 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "contrib_peer_relative_anomaly",
         "contrib_earnings",
         "contrib_revision_impulse",
+        "contrib_revision_jerk",
         "contrib_estimate_term_structure",
         "contrib_growth",
         "contrib_momentum",
         "contrib_news_event",
+        "contrib_news_shock",
         "contrib_capital_allocation",
         "contrib_recovery_transition",
         "contrib_investment_restraint",
         "contrib_accrual_quality",
+        "contrib_quality_acceleration",
         "contrib_insider_conviction",
         "contrib_news_theme_drift",
         "contrib_employee_efficiency",
         "contrib_forensic",
+        "estimate_term_structure_overlap_penalty",
     ]
 
     df = _concat_missing_columns(df, {col: np.nan for col in numeric_cols})
@@ -1475,6 +1622,8 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         eligible["z_sue_signal"] = eligible["z_sue_signal"].clip(-2.0, 2.0)
     if "z_revision_impulse_signal" in eligible.columns:
         eligible["z_revision_impulse_signal"] = eligible["z_revision_impulse_signal"].clip(-2.0, 2.0)
+    if "z_revision_jerk_signal" in eligible.columns:
+        eligible["z_revision_jerk_signal"] = eligible["z_revision_jerk_signal"].clip(-2.0, 2.0)
     if "z_estimate_term_structure_signal" in eligible.columns:
         eligible["z_estimate_term_structure_signal"] = eligible["z_estimate_term_structure_signal"].clip(-2.0, 2.0)
     if "z_revenue_growth_yoy" in eligible.columns:
@@ -1491,12 +1640,16 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         eligible["z_price_momentum_effective_signal"] = eligible["z_price_momentum_effective_signal"].clip(-2.0, 2.0)
     if "z_news_event_effective_signal" in eligible.columns:
         eligible["z_news_event_effective_signal"] = eligible["z_news_event_effective_signal"].clip(-2.0, 2.0)
+    if "z_news_shock_signal" in eligible.columns:
+        eligible["z_news_shock_signal"] = eligible["z_news_shock_signal"].clip(-2.0, 2.0)
     if "z_capital_allocation_quality_signal" in eligible.columns:
         eligible["z_capital_allocation_quality_signal"] = eligible["z_capital_allocation_quality_signal"].clip(-2.0, 2.0)
     if "z_investment_restraint_signal" in eligible.columns:
         eligible["z_investment_restraint_signal"] = eligible["z_investment_restraint_signal"].clip(-2.0, 2.0)
     if "z_accrual_quality_signal" in eligible.columns:
         eligible["z_accrual_quality_signal"] = eligible["z_accrual_quality_signal"].clip(-2.0, 2.0)
+    if "z_quality_acceleration_signal" in eligible.columns:
+        eligible["z_quality_acceleration_signal"] = eligible["z_quality_acceleration_signal"].clip(-2.0, 2.0)
     if "z_insider_conviction_signal" in eligible.columns:
         eligible["z_insider_conviction_signal"] = eligible["z_insider_conviction_signal"].clip(-2.0, 2.0)
     if "z_news_theme_drift_signal" in eligible.columns:
@@ -1565,6 +1718,11 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         if getattr(config, "use_revision_impulse", False) and eligible["revision_impulse_signal"].notna().any()
         else 0.0
     )
+    revision_jerk_weight = (
+        float(getattr(config, "revision_jerk_weight", 0.0))
+        if getattr(config, "use_revision_jerk", False) and eligible["revision_jerk_signal"].notna().any()
+        else 0.0
+    )
     estimate_term_structure_weight = (
         float(getattr(config, "estimate_term_structure_weight", 0.0))
         if getattr(config, "use_estimate_term_structure", False)
@@ -1580,6 +1738,12 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         )
         else 0.0
     )
+    quality_acceleration_weight = (
+        float(getattr(config, "quality_acceleration_weight", 0.0))
+        if getattr(config, "use_quality_acceleration", False)
+        and eligible["quality_acceleration_signal"].notna().any()
+        else 0.0
+    )
     momentum_weight = (
         float(config.momentum_weight)
         if getattr(config, "use_price_momentum", False) and eligible["price_momentum_effective_signal"].notna().any()
@@ -1588,6 +1752,11 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
     news_weight = (
         float(getattr(config, "news_event_weight", 0.0))
         if getattr(config, "use_news_events", False) and eligible["news_event_effective_signal"].notna().any()
+        else 0.0
+    )
+    news_shock_weight = (
+        float(getattr(config, "news_shock_weight", 0.0))
+        if getattr(config, "use_news_shock", False) and eligible["news_shock_signal"].notna().any()
         else 0.0
     )
     capital_allocation_weight = (
@@ -1637,30 +1806,17 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
 
     recovery_transition_weight = 0.0
 
-    core_scale = max(
-        0.0,
-        1.0
-        - pead_weight
-        - revision_impulse_weight
-        - estimate_term_structure_weight
-        - growth_weight
-        - momentum_weight
-        - news_weight
-        - capital_allocation_weight
-        - investment_restraint_weight
-        - accrual_quality_weight
-        - insider_conviction_weight
-        - news_theme_drift_weight
-        - peer_relative_anomaly_weight
-        - employee_weight,
-    )
-
-    employee_component = 0.0
+    employee_component = pd.Series(0.0, index=eligible.index, dtype=float)
+    employee_efficiency_signal_confidence = pd.Series(0.0, index=eligible.index, dtype=float)
     if employee_weight > 0.0:
-        employee_component = (
-            0.5 * eligible["z_revenue_per_employee"].fillna(0.0)
-            + 0.5 * eligible["z_gross_profit_per_employee"].fillna(0.0)
+        employee_component_frame = pd.DataFrame(
+            {
+                "revenue_per_employee": eligible["z_revenue_per_employee"],
+                "gross_profit_per_employee": eligible["z_gross_profit_per_employee"],
+            }
         )
+        employee_efficiency_signal_confidence = employee_component_frame.notna().mean(axis=1).fillna(0.0).clip(0.0, 1.0)
+        employee_component = employee_component_frame.mean(axis=1).fillna(0.0)
     pead_component = (
         eligible["z_pead_signal"].fillna(0.0)
         if "z_pead_signal" in eligible.columns
@@ -1680,11 +1836,28 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         if "z_revision_impulse_signal" in eligible.columns
         else pd.Series(0.0, index=eligible.index, dtype=float)
     )
+    revision_jerk_component = (
+        eligible["z_revision_jerk_signal"].fillna(0.0)
+        if "z_revision_jerk_signal" in eligible.columns
+        else pd.Series(0.0, index=eligible.index, dtype=float)
+    )
     estimate_term_structure_component = (
         eligible["z_estimate_term_structure_signal"].fillna(0.0)
         if "z_estimate_term_structure_signal" in eligible.columns
         else pd.Series(0.0, index=eligible.index, dtype=float)
     )
+    eligible["estimate_term_structure_overlap_penalty"] = 0.0
+    estimate_overlap_predictors: dict[str, pd.Series] = {}
+    if revision_impulse_weight > 0.0:
+        estimate_overlap_predictors["revision_impulse"] = revision_impulse_component
+    if revision_jerk_weight > 0.0:
+        estimate_overlap_predictors["revision_jerk"] = revision_jerk_component
+    if estimate_overlap_predictors and estimate_term_structure_weight > 0.0:
+        estimate_term_structure_component, estimate_overlap_penalty = _residualize_against_predictors(
+            estimate_term_structure_component,
+            estimate_overlap_predictors,
+        )
+        eligible["estimate_term_structure_overlap_penalty"] = float(estimate_overlap_penalty)
     growth_component = (
         0.45
         * (
@@ -1699,6 +1872,11 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
             else pd.Series(0.0, index=eligible.index, dtype=float)
         )
     )
+    quality_acceleration_component = (
+        eligible["z_quality_acceleration_signal"].fillna(0.0)
+        if "z_quality_acceleration_signal" in eligible.columns
+        else pd.Series(0.0, index=eligible.index, dtype=float)
+    )
     momentum_component = (
         eligible["z_price_momentum_effective_signal"].fillna(0.0)
         if "z_price_momentum_effective_signal" in eligible.columns
@@ -1707,6 +1885,11 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
     news_component = (
         eligible["z_news_event_effective_signal"].fillna(0.0)
         if "z_news_event_effective_signal" in eligible.columns
+        else pd.Series(0.0, index=eligible.index, dtype=float)
+    )
+    news_shock_component = (
+        eligible["z_news_shock_signal"].fillna(0.0)
+        if "z_news_shock_signal" in eligible.columns
         else pd.Series(0.0, index=eligible.index, dtype=float)
     )
     residual_value_component = (
@@ -1768,13 +1951,13 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         and eligible["recovery_transition_signal"].notna().any()
         else 0.0
     )
-    core_scale = max(0.0, core_scale - recovery_transition_weight)
 
     earnings_coverage = (
         0.5 * _series_or_zero(eligible, "pead_has_setup_coverage")
         + 0.5 * _series_or_zero(eligible, "sue_has_coverage")
     ).clip(0.0, 1.0)
     revision_coverage = _series_or_zero(eligible, "revision_impulse_coverage_component").clip(0.0, 1.0)
+    revision_disagreement_penalty = _series_or_zero(eligible, "revision_impulse_disagreement_penalty").clip(0.0, 1.0)
     growth_coverage = (
         0.6 * _series_or_zero(eligible, "revenue_growth_has_coverage")
         + 0.4 * _series_or_nan(eligible, "revenue_acceleration").notna().astype(float)
@@ -1783,11 +1966,22 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
     momentum_proxy_used = _series_or_zero(eligible, "price_momentum_proxy_used").clip(0.0, 1.0)
 
     eligible["earnings_signal_confidence"] = _coverage_scale(earnings_coverage)
-    eligible["revision_signal_confidence"] = _coverage_scale(revision_coverage, floor=0.70)
+    eligible["revision_signal_confidence"] = (
+        _coverage_scale(revision_coverage, floor=0.60) * (0.80 + 0.20 * (1.0 - revision_disagreement_penalty))
+    ).clip(0.0, 1.0)
+    eligible["revision_jerk_signal_confidence"] = (
+        _series_or_zero(eligible, "revision_jerk_has_coverage").clip(0.0, 1.0)
+        * (0.50 + 0.50 * revision_coverage)
+        * (0.70 + 0.30 * (1.0 - revision_disagreement_penalty))
+    ).clip(0.0, 1.0)
     eligible["estimate_term_structure_signal_confidence"] = _coverage_scale(
         _series_or_zero(eligible, "estimate_term_structure_coverage_component").clip(0.0, 1.0),
-        floor=0.70,
-    )
+        floor=0.60,
+    ).clip(0.0, 1.0)
+    eligible["estimate_term_structure_signal_confidence"] = (
+        eligible["estimate_term_structure_signal_confidence"]
+        * (1.0 - 0.35 * _series_or_zero(eligible, "estimate_term_structure_overlap_penalty").clip(0.0, 1.0))
+    ).clip(0.0, 1.0)
     eligible["growth_signal_confidence"] = _coverage_scale(growth_coverage)
     eligible["momentum_signal_confidence"] = (
         momentum_history_coverage.where(momentum_history_coverage >= 1.0, 0.0)
@@ -1817,6 +2011,11 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         eligible["news_signal_confidence"] = (
             eligible["news_signal_confidence"] + 0.10 * news_confirmation_coverage
         ).clip(0.0, 1.0)
+    news_shock_volume_scale = (_series_or_zero(eligible, "news_article_volume_spike").clip(0.0, 3.0) / 3.0).clip(0.0, 1.0)
+    eligible["news_shock_signal_confidence"] = (
+        _series_or_zero(eligible, "news_shock_has_coverage").clip(0.0, 1.0)
+        * (0.50 + 0.30 * news_shock_volume_scale + 0.20 * _series_or_zero(eligible, "news_novelty_score").clip(0.0, 1.0))
+    ).clip(0.0, 1.0)
     eligible["news_has_coverage"] = (
         news_article_count >= float(getattr(config, "min_news_articles", 1))
     ) | (
@@ -1880,106 +2079,191 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         * (0.55 + 0.45 * accrual_depth)
         * (0.75 + 0.25 * accrual_periodicity)
     ).clip(0.0, 1.0)
-    eligible["insider_conviction_signal_confidence"] = _coverage_scale(
-        _series_or_zero(eligible, "insider_conviction_has_coverage"),
-        floor=0.60,
+    quality_periodicity = _series_or_zero(eligible, "quality_acceleration_periodicity").clip(0.0, 1.0)
+    quality_full_count = 4.0 + 2.0 * quality_periodicity
+    quality_depth = (
+        _series_or_zero(eligible, "quality_acceleration_measure_count") / quality_full_count.replace(0.0, np.nan)
+    ).fillna(0.0).clip(0.0, 1.0)
+    eligible["quality_acceleration_signal_confidence"] = (
+        _series_or_zero(eligible, "quality_acceleration_has_coverage").clip(0.0, 1.0)
+        * (0.55 + 0.45 * quality_depth)
+        * (0.75 + 0.25 * quality_periodicity)
+    ).clip(0.0, 1.0)
+    insider_trade_depth = _depth_scale(_series_or_zero(eligible, "insider_conviction_trade_count"), 4.0)
+    insider_participant_depth = _depth_scale(
+        _series_or_zero(eligible, "insider_conviction_buy_person_count")
+        + _series_or_zero(eligible, "insider_conviction_sell_person_count"),
+        3.0,
     )
-    eligible["news_theme_drift_signal_confidence"] = _coverage_scale(
-        _series_or_zero(eligible, "news_theme_drift_has_coverage"),
-        floor=0.60,
+    eligible["insider_conviction_signal_confidence"] = (
+        _series_or_zero(eligible, "insider_conviction_has_coverage").clip(0.0, 1.0)
+        * (0.35 + 0.35 * insider_trade_depth + 0.20 * insider_participant_depth)
+        * (0.70 + 0.30 * _series_or_zero(eligible, "insider_conviction_signal").abs().clip(0.0, 1.0))
+    ).clip(0.0, 1.0)
+    news_theme_recent_count = _series_or_zero(eligible, "news_theme_drift_recent_article_count")
+    news_theme_baseline_count = _series_or_zero(eligible, "news_theme_drift_baseline_article_count")
+    news_theme_overlap_count = np.minimum(news_theme_recent_count, news_theme_baseline_count)
+    news_theme_max_count = pd.concat([news_theme_recent_count, news_theme_baseline_count], axis=1).max(axis=1).clip(lower=1.0)
+    news_theme_depth = _depth_scale(news_theme_overlap_count, 3.0)
+    news_theme_balance = (news_theme_overlap_count / news_theme_max_count).clip(0.0, 1.0)
+    eligible["news_theme_drift_signal_confidence"] = (
+        _series_or_zero(eligible, "news_theme_drift_has_coverage").clip(0.0, 1.0)
+        * (0.30 + 0.45 * news_theme_depth + 0.25 * news_theme_balance)
+    ).clip(0.0, 1.0)
+
+    core_floor = float(np.clip(float(getattr(config, "core_weight_floor", 0.60) or 0.60), 0.0, 1.0))
+    max_optional_share = max(0.0, 1.0 - core_floor)
+    configured_optional_weights = {
+        "peer_relative_anomaly": peer_relative_anomaly_weight,
+        "earnings": pead_weight,
+        "revision_impulse": revision_impulse_weight,
+        "revision_jerk": revision_jerk_weight,
+        "estimate_term_structure": estimate_term_structure_weight,
+        "growth": growth_weight,
+        "quality_acceleration": quality_acceleration_weight,
+        "momentum": momentum_weight,
+        "news_event": news_weight,
+        "news_shock": news_shock_weight,
+        "capital_allocation": capital_allocation_weight,
+        "recovery_transition": recovery_transition_weight,
+        "investment_restraint": investment_restraint_weight,
+        "accrual_quality": accrual_quality_weight,
+        "insider_conviction": insider_conviction_weight,
+        "news_theme_drift": news_theme_drift_weight,
+        "employee_efficiency": employee_weight,
+    }
+    configured_optional_total = float(sum(configured_optional_weights.values()))
+    optional_budget_scale = (
+        min(1.0, max_optional_share / configured_optional_total)
+        if configured_optional_total > 0.0
+        else 1.0
+    )
+    scaled_optional_weights = {
+        name: float(weight) * optional_budget_scale
+        for name, weight in configured_optional_weights.items()
+    }
+
+    optional_activation = {
+        "peer_relative_anomaly": scaled_optional_weights["peer_relative_anomaly"]
+        * eligible["peer_relative_anomaly_signal_confidence"].fillna(0.0),
+        "earnings": scaled_optional_weights["earnings"] * eligible["earnings_signal_confidence"].fillna(0.0),
+        "revision_impulse": scaled_optional_weights["revision_impulse"]
+        * eligible["revision_signal_confidence"].fillna(0.0),
+        "revision_jerk": scaled_optional_weights["revision_jerk"]
+        * eligible["revision_jerk_signal_confidence"].fillna(0.0),
+        "estimate_term_structure": scaled_optional_weights["estimate_term_structure"]
+        * eligible["estimate_term_structure_signal_confidence"].fillna(0.0),
+        "growth": scaled_optional_weights["growth"] * eligible["growth_signal_confidence"].fillna(0.0),
+        "quality_acceleration": scaled_optional_weights["quality_acceleration"]
+        * eligible["quality_acceleration_signal_confidence"].fillna(0.0),
+        "momentum": scaled_optional_weights["momentum"] * eligible["momentum_signal_confidence"].fillna(0.0),
+        "news_event": scaled_optional_weights["news_event"] * eligible["news_signal_confidence"].fillna(0.0),
+        "news_shock": scaled_optional_weights["news_shock"] * eligible["news_shock_signal_confidence"].fillna(0.0),
+        "capital_allocation": scaled_optional_weights["capital_allocation"]
+        * eligible["capital_allocation_signal_confidence"].fillna(0.0),
+        "recovery_transition": scaled_optional_weights["recovery_transition"]
+        * eligible["recovery_transition_signal_confidence"].fillna(0.0),
+        "investment_restraint": scaled_optional_weights["investment_restraint"]
+        * eligible["investment_restraint_signal_confidence"].fillna(0.0),
+        "accrual_quality": scaled_optional_weights["accrual_quality"]
+        * eligible["accrual_quality_signal_confidence"].fillna(0.0),
+        "insider_conviction": scaled_optional_weights["insider_conviction"]
+        * eligible["insider_conviction_signal_confidence"].fillna(0.0),
+        "news_theme_drift": scaled_optional_weights["news_theme_drift"]
+        * eligible["news_theme_drift_signal_confidence"].fillna(0.0),
+        "employee_efficiency": scaled_optional_weights["employee_efficiency"]
+        * employee_efficiency_signal_confidence.fillna(0.0),
+    }
+    optional_activation_frame = pd.DataFrame(optional_activation, index=eligible.index)
+    eligible["effective_optional_share"] = optional_activation_frame.sum(axis=1).clip(0.0, max_optional_share)
+    eligible["effective_core_share"] = (1.0 - eligible["effective_optional_share"]).clip(core_floor, 1.0)
+
+    core_effective_weights = _normalize_weight_block(
+        {
+            "shareholder_yield": shareholder_component_weight,
+            "gross_profitability": gross_profitability_component_weight,
+            "adjusted_book_to_market": adjusted_book_component_weight,
+            "residual_value": residual_component_weight * eligible["residual_value_signal_confidence"].fillna(0.0),
+            "compounder_persistence": compounder_component_weight
+            * eligible["compounder_persistence_signal_confidence"].fillna(0.0),
+        },
+        eligible["effective_core_share"],
+    )
+    optional_effective_weights = _normalize_weight_block(
+        {
+            "peer_relative_anomaly": optional_activation["peer_relative_anomaly"],
+            "earnings": optional_activation["earnings"] * pead_multiplier,
+            "revision_impulse": optional_activation["revision_impulse"] * revision_multiplier,
+            "revision_jerk": optional_activation["revision_jerk"],
+            "estimate_term_structure": optional_activation["estimate_term_structure"],
+            "growth": optional_activation["growth"] * growth_multiplier,
+            "quality_acceleration": optional_activation["quality_acceleration"],
+            "momentum": optional_activation["momentum"] * momentum_multiplier,
+            "news_event": optional_activation["news_event"],
+            "news_shock": optional_activation["news_shock"],
+            "capital_allocation": optional_activation["capital_allocation"],
+            "recovery_transition": optional_activation["recovery_transition"],
+            "investment_restraint": optional_activation["investment_restraint"],
+            "accrual_quality": optional_activation["accrual_quality"],
+            "insider_conviction": optional_activation["insider_conviction"],
+            "news_theme_drift": optional_activation["news_theme_drift"],
+            "employee_efficiency": optional_activation["employee_efficiency"],
+        },
+        eligible["effective_optional_share"],
     )
 
     eligible["contrib_shareholder_yield"] = (
-        core_scale * shareholder_component_weight * eligible["z_shareholder_yield"].fillna(0.0)
+        core_effective_weights["shareholder_yield"] * eligible["z_shareholder_yield"].fillna(0.0)
     )
     eligible["contrib_gross_profitability"] = (
-        core_scale * gross_profitability_component_weight * eligible["z_gross_profitability"].fillna(0.0)
+        core_effective_weights["gross_profitability"] * eligible["z_gross_profitability"].fillna(0.0)
     )
     eligible["contrib_adjusted_book_to_market"] = (
-        core_scale * adjusted_book_component_weight * eligible["z_adjusted_book_to_market"].fillna(0.0)
+        core_effective_weights["adjusted_book_to_market"] * eligible["z_adjusted_book_to_market"].fillna(0.0)
     )
-    eligible["contrib_residual_value"] = (
-        core_scale
-        * residual_component_weight
-        * eligible["residual_value_signal_confidence"].fillna(0.0)
-        * residual_value_component
-    )
+    eligible["contrib_residual_value"] = core_effective_weights["residual_value"] * residual_value_component
     eligible["contrib_compounder_persistence"] = (
-        core_scale
-        * compounder_component_weight
-        * eligible["compounder_persistence_signal_confidence"].fillna(0.0)
-        * compounder_persistence_component
+        core_effective_weights["compounder_persistence"] * compounder_persistence_component
     )
     eligible["contrib_peer_relative_anomaly"] = (
-        peer_relative_anomaly_weight
-        * eligible["peer_relative_anomaly_signal_confidence"].fillna(0.0)
-        * peer_relative_anomaly_component
+        optional_effective_weights["peer_relative_anomaly"] * peer_relative_anomaly_component
     )
-    eligible["contrib_earnings"] = (
-        pead_weight
-        * pead_multiplier
-        * eligible["earnings_signal_confidence"].fillna(1.0)
-        * earnings_component
+    eligible["contrib_earnings"] = optional_effective_weights["earnings"] * earnings_component
+    eligible["contrib_growth"] = optional_effective_weights["growth"] * growth_component
+    eligible["contrib_quality_acceleration"] = (
+        optional_effective_weights["quality_acceleration"] * quality_acceleration_component
     )
-    eligible["contrib_growth"] = (
-        growth_weight
-        * growth_multiplier
-        * eligible["growth_signal_confidence"].fillna(1.0)
-        * growth_component
-    )
-    eligible["contrib_momentum"] = (
-        momentum_weight
-        * momentum_multiplier
-        * eligible["momentum_signal_confidence"].fillna(0.0)
-        * momentum_component
-    )
-    eligible["contrib_news_event"] = (
-        news_weight
-        * eligible["news_signal_confidence"].fillna(0.0)
-        * news_component
-    )
+    eligible["contrib_momentum"] = optional_effective_weights["momentum"] * momentum_component
+    eligible["contrib_news_event"] = optional_effective_weights["news_event"] * news_component
+    eligible["contrib_news_shock"] = optional_effective_weights["news_shock"] * news_shock_component
     eligible["contrib_revision_impulse"] = (
-        revision_impulse_weight
-        * revision_multiplier
-        * eligible["revision_signal_confidence"].fillna(1.0)
-        * revision_impulse_component
+        optional_effective_weights["revision_impulse"] * revision_impulse_component
     )
+    eligible["contrib_revision_jerk"] = optional_effective_weights["revision_jerk"] * revision_jerk_component
     eligible["contrib_estimate_term_structure"] = (
-        estimate_term_structure_weight
-        * eligible["estimate_term_structure_signal_confidence"].fillna(0.0)
-        * estimate_term_structure_component
+        optional_effective_weights["estimate_term_structure"] * estimate_term_structure_component
     )
     eligible["contrib_capital_allocation"] = (
-        capital_allocation_weight
-        * eligible["capital_allocation_signal_confidence"].fillna(0.0)
-        * capital_allocation_component
+        optional_effective_weights["capital_allocation"] * capital_allocation_component
     )
     eligible["contrib_recovery_transition"] = (
-        recovery_transition_weight
-        * eligible["recovery_transition_signal_confidence"].fillna(0.0)
-        * recovery_transition_component
+        optional_effective_weights["recovery_transition"] * recovery_transition_component
     )
     eligible["contrib_investment_restraint"] = (
-        investment_restraint_weight
-        * eligible["investment_restraint_signal_confidence"].fillna(0.0)
-        * investment_restraint_component
+        optional_effective_weights["investment_restraint"] * investment_restraint_component
     )
     eligible["contrib_accrual_quality"] = (
-        accrual_quality_weight
-        * eligible["accrual_quality_signal_confidence"].fillna(0.0)
-        * accrual_quality_component
+        optional_effective_weights["accrual_quality"] * accrual_quality_component
     )
     eligible["contrib_insider_conviction"] = (
-        insider_conviction_weight
-        * eligible["insider_conviction_signal_confidence"].fillna(0.0)
-        * insider_conviction_component
+        optional_effective_weights["insider_conviction"] * insider_conviction_component
     )
     eligible["contrib_news_theme_drift"] = (
-        news_theme_drift_weight
-        * eligible["news_theme_drift_signal_confidence"].fillna(0.0)
-        * news_theme_drift_component
+        optional_effective_weights["news_theme_drift"] * news_theme_drift_component
     )
-    eligible["contrib_employee_efficiency"] = employee_weight * employee_component
+    eligible["contrib_employee_efficiency"] = (
+        optional_effective_weights["employee_efficiency"] * employee_component
+    )
     eligible["contrib_forensic"] = (
         -float(config.forensic_weight) * forensic_multiplier * eligible["forensic_penalty"].fillna(0.0)
     )
@@ -1993,9 +2277,12 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         + eligible["contrib_peer_relative_anomaly"]
         + eligible["contrib_earnings"]
         + eligible["contrib_growth"]
+        + eligible["contrib_quality_acceleration"]
         + eligible["contrib_momentum"]
         + eligible["contrib_news_event"]
+        + eligible["contrib_news_shock"]
         + eligible["contrib_revision_impulse"]
+        + eligible["contrib_revision_jerk"]
         + eligible["contrib_estimate_term_structure"]
         + eligible["contrib_capital_allocation"]
         + eligible["contrib_recovery_transition"]
@@ -2029,7 +2316,7 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         )
     else:
         eligible["sentiment_has_coverage"] = False
-    if not getattr(config, "use_news_events", False):
+    if not getattr(config, "use_news_events", False) and not getattr(config, "use_news_shock", False):
         eligible["news_has_coverage"] = False
 
     eligible = eligible.loc[~fails_pead & ~fails_sentiment].copy()

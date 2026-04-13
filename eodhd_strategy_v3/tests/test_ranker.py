@@ -374,6 +374,181 @@ def test_investment_and_accrual_sleeves_can_break_tie_between_similar_names() ->
     assert ranked["symbol"].tolist() == ["DISCIPLINED", "SPRAWLER"]
 
 
+def test_quality_acceleration_sleeve_can_break_tie_between_similar_names() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                **_base_row("INFLECTING"),
+                "quality_acceleration_signal": 0.85,
+                "quality_acceleration_has_coverage": 1.0,
+                "quality_acceleration_measure_count": 6.0,
+                "quality_acceleration_periodicity": 1.0,
+            },
+            {
+                **_base_row("STALLING"),
+                "quality_acceleration_signal": -0.20,
+                "quality_acceleration_has_coverage": 1.0,
+                "quality_acceleration_measure_count": 6.0,
+                "quality_acceleration_periodicity": 1.0,
+            },
+        ]
+    )
+
+    _, ranked, _ = build_ranked_frame(
+        df,
+        _config(
+            use_pead=False,
+            use_revision_impulse=False,
+            use_sentiment=False,
+            use_beneish=False,
+            use_accrual_volatility=False,
+            use_quality_acceleration=True,
+            quality_acceleration_weight=0.05,
+        ),
+    )
+
+    assert ranked["symbol"].tolist() == ["INFLECTING", "STALLING"]
+
+
+def test_revision_jerk_sleeve_can_break_tie_between_similar_names() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                **_base_row("ACCEL"),
+                "revision_jerk_signal": 0.75,
+                "revision_jerk_has_coverage": 1.0,
+            },
+            {
+                **_base_row("FLAT"),
+                "revision_jerk_signal": -0.20,
+                "revision_jerk_has_coverage": 1.0,
+            },
+        ]
+    )
+
+    _, ranked, _ = build_ranked_frame(
+        df,
+        _config(
+            use_pead=False,
+            use_revision_impulse=False,
+            use_sentiment=False,
+            use_beneish=False,
+            use_accrual_volatility=False,
+            use_revision_jerk=True,
+            revision_jerk_weight=0.05,
+        ),
+    )
+
+    assert ranked["symbol"].tolist() == ["ACCEL", "FLAT"]
+
+
+def test_news_shock_sleeve_can_break_tie_between_similar_names() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                **_base_row("SHOCKUP"),
+                "news_shock_signal": 0.65,
+                "news_shock_has_coverage": 1.0,
+                "news_article_volume_spike": 2.0,
+                "news_novelty_score": 0.90,
+            },
+            {
+                **_base_row("SHOCKDOWN"),
+                "news_shock_signal": -0.15,
+                "news_shock_has_coverage": 1.0,
+                "news_article_volume_spike": 0.8,
+                "news_novelty_score": 0.40,
+            },
+        ]
+    )
+
+    _, ranked, _ = build_ranked_frame(
+        df,
+        _config(
+            use_pead=False,
+            use_revision_impulse=False,
+            use_sentiment=False,
+            use_beneish=False,
+            use_accrual_volatility=False,
+            use_news_shock=True,
+            news_shock_weight=0.05,
+        ),
+    )
+
+    assert ranked["symbol"].tolist() == ["SHOCKUP", "SHOCKDOWN"]
+
+
+def test_stock_level_weight_renormalization_returns_unused_optional_budget_to_core() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                **_base_row("COVERED"),
+                "investment_restraint_signal": 0.60,
+                "investment_restraint_has_coverage": 1.0,
+                "investment_restraint_measure_count": 6.0,
+            },
+            {
+                **_base_row("UNCOVERED"),
+                "investment_restraint_signal": None,
+                "investment_restraint_has_coverage": 0.0,
+                "investment_restraint_measure_count": 0.0,
+            },
+        ]
+    )
+
+    all_rows, _, _ = build_ranked_frame(
+        df,
+        _config(
+            use_pead=False,
+            use_revision_impulse=False,
+            use_sentiment=False,
+            use_beneish=False,
+            use_accrual_volatility=False,
+            use_investment_restraint=True,
+            investment_restraint_weight=0.20,
+            core_weight_floor=0.60,
+        ),
+    )
+
+    covered = all_rows.loc[all_rows["symbol"] == "COVERED"].iloc[0]
+    uncovered = all_rows.loc[all_rows["symbol"] == "UNCOVERED"].iloc[0]
+
+    assert covered["effective_optional_share"] > 0.19
+    assert covered["effective_core_share"] < 0.81
+    assert uncovered["effective_optional_share"] == 0.0
+    assert uncovered["effective_core_share"] == 1.0
+
+
+def test_estimate_term_structure_overlap_control_residualizes_against_revision_family() -> None:
+    rows = []
+    for idx in range(14):
+        row = _base_row(f"PAIR{idx}")
+        signal = 0.70 - idx * 0.08
+        row["revision_impulse_signal"] = signal
+        row["revision_impulse_has_coverage"] = 1.0
+        row["revision_impulse_coverage_component"] = 1.0
+        row["estimate_term_structure_signal"] = signal
+        row["estimate_term_structure_has_coverage"] = 1.0
+        row["estimate_term_structure_coverage_component"] = 1.0
+        rows.append(row)
+
+    all_rows, ranked, _ = build_ranked_frame(
+        pd.DataFrame(rows),
+        _config(
+            use_pead=False,
+            use_sentiment=False,
+            use_beneish=False,
+            use_accrual_volatility=False,
+            use_revision_impulse=True,
+            use_estimate_term_structure=True,
+        ),
+    )
+
+    assert all_rows["estimate_term_structure_overlap_penalty"].max() > 0.9
+    assert ranked["contrib_revision_impulse"].abs().max() > ranked["contrib_estimate_term_structure"].abs().max()
+    assert ranked["estimate_term_structure_signal_confidence"].max() < 1.0
+
+
 def test_build_ranked_frame_shrinks_residual_and_compounder_on_thinner_coverage() -> None:
     df = pd.DataFrame(
         [

@@ -16,6 +16,7 @@ from eodhd_strategy.advanced_factors import (
     compute_pead_metrics_from_fundamentals,
     compute_price_momentum_metrics_from_history,
     compute_price_momentum_proxy_metrics,
+    compute_quality_acceleration_metrics_from_fundamentals,
     compute_recovery_fundamental_metrics,
     compute_revenue_growth_metrics_from_fundamentals,
     compute_revision_impulse_metrics_from_fundamentals,
@@ -271,6 +272,44 @@ def test_revision_impulse_low_coverage_scales_down_signal() -> None:
     assert low_coverage["revision_impulse_signal"] < high_coverage["revision_impulse_signal"]
 
 
+def test_revision_jerk_rewards_accelerating_estimate_change() -> None:
+    accelerating = _make_earnings_fundamentals()
+    fading = deepcopy(_make_earnings_fundamentals())
+
+    accelerating["Earnings"]["Trend"]["2025-12-31"].update(
+        {
+            "epsTrendCurrent": 1.16,
+            "epsTrend7daysAgo": 1.06,
+            "epsTrend30daysAgo": 0.99,
+            "earningsEstimateHigh": 1.22,
+            "earningsEstimateLow": 0.98,
+        }
+    )
+    fading["Earnings"]["Trend"]["2025-12-31"].update(
+        {
+            "epsTrendCurrent": 1.16,
+            "epsTrend7daysAgo": 1.14,
+            "epsTrend30daysAgo": 1.00,
+            "earningsEstimateHigh": 1.20,
+            "earningsEstimateLow": 0.99,
+        }
+    )
+
+    accelerating_metrics = compute_revision_impulse_metrics_from_fundamentals(
+        accelerating,
+        min_revision_analysts=4,
+    )
+    fading_metrics = compute_revision_impulse_metrics_from_fundamentals(
+        fading,
+        min_revision_analysts=4,
+    )
+
+    assert accelerating_metrics["revision_jerk_signal"] is not None
+    assert fading_metrics["revision_jerk_signal"] is not None
+    assert accelerating_metrics["revision_jerk_signal"] > fading_metrics["revision_jerk_signal"]
+    assert accelerating_metrics["revision_jerk_has_coverage"] == 1.0
+
+
 def test_estimate_term_structure_rewards_persistent_positive_revisions() -> None:
     fundamentals = _make_earnings_fundamentals()
     fundamentals["Earnings"]["Trend"]["2025-09-30"] = {
@@ -407,6 +446,51 @@ def test_news_event_metrics_extract_structured_signal_from_recent_articles() -> 
     assert 0.0 <= metrics["news_saturation_score"] <= 1.0
 
 
+def test_news_event_metrics_compute_positive_shock_against_baseline() -> None:
+    today = pd.Timestamp.now(tz="UTC").normalize()
+
+    class FakeClient:
+        def get_news(self, symbol: str, start_date: str, end_date: str, limit: int):
+            return [
+                {
+                    "date": (today - pd.Timedelta(days=1)).isoformat(),
+                    "title": "Acme wins major contract and raises guidance",
+                    "tags": ["contract win", "estimate revisions"],
+                    "symbols": [symbol],
+                    "sentiment": {"polarity": 0.8},
+                },
+                {
+                    "date": (today - pd.Timedelta(days=3)).isoformat(),
+                    "title": "Acme upgraded after product launch momentum",
+                    "tags": ["upgrade"],
+                    "symbols": [symbol],
+                    "sentiment": {"polarity": 0.7},
+                },
+                {
+                    "date": (today - pd.Timedelta(days=15)).isoformat(),
+                    "title": "Acme faces soft demand concerns",
+                    "tags": ["warning"],
+                    "symbols": [symbol],
+                    "sentiment": {"polarity": -0.4},
+                },
+                {
+                    "date": (today - pd.Timedelta(days=22)).isoformat(),
+                    "title": "Acme sees muted order intake",
+                    "tags": ["downgrade"],
+                    "symbols": [symbol],
+                    "sentiment": {"polarity": -0.3},
+                },
+            ]
+
+    metrics = compute_news_event_metrics(FakeClient(), "ACME.US", lookback_days=7, alpha_factor_spec="v2")
+
+    assert metrics["news_shock_signal"] is not None
+    assert metrics["news_shock_signal"] > 0
+    assert metrics["news_shock_has_coverage"] > 0
+    assert metrics["news_article_volume_spike"] > 0
+    assert metrics["news_baseline_article_count"] > 0
+
+
 def test_compounder_persistence_signal_handles_partial_statement_subcomponents() -> None:
     metrics = compute_compounder_persistence_metrics_from_fundamentals(_make_statement_fundamentals())
 
@@ -515,6 +599,32 @@ def test_accrual_quality_distinguishes_cash_backed_from_accrual_heavy_earnings()
     assert dirty_metrics["accrual_quality_signal"] is not None
     assert dirty_metrics["accrual_quality_signal"] < clean_metrics["accrual_quality_signal"]
     assert dirty_metrics["accrual_quality_cash_conversion"] is not None
+
+
+def test_quality_acceleration_rewards_improving_business_quality() -> None:
+    improving = _make_statement_fundamentals()
+    stalling = deepcopy(_make_statement_fundamentals())
+
+    stalling["Financials"]["Income_Statement"]["quarterly"]["2025-12-31"].update(
+        {
+            "netIncome": 20.0,
+            "costOfRevenue": 210.0,
+            "grossProfit": 120.0,
+        }
+    )
+    stalling["Financials"]["Cash_Flow"]["quarterly"]["2025-12-31"]["totalCashFromOperatingActivities"] = 10.0
+    stalling["Financials"]["Balance_Sheet"]["quarterly"]["2025-12-31"]["netReceivables"] = 145.0
+    stalling["Financials"]["Balance_Sheet"]["quarterly"]["2025-12-31"]["inventory"] = 98.0
+    stalling["Financials"]["Balance_Sheet"]["quarterly"]["2025-09-30"]["netReceivables"] = 118.0
+    stalling["Financials"]["Balance_Sheet"]["quarterly"]["2025-09-30"]["inventory"] = 76.0
+
+    improving_metrics = compute_quality_acceleration_metrics_from_fundamentals(improving)
+    stalling_metrics = compute_quality_acceleration_metrics_from_fundamentals(stalling)
+
+    assert improving_metrics["quality_acceleration_signal"] is not None
+    assert stalling_metrics["quality_acceleration_signal"] is not None
+    assert improving_metrics["quality_acceleration_signal"] > stalling_metrics["quality_acceleration_signal"]
+    assert improving_metrics["quality_acceleration_measure_count"] >= 3
 
 
 def test_capital_allocation_quality_rewards_fcf_funded_buybacks_and_deleveraging() -> None:

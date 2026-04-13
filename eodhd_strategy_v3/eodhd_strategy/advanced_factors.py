@@ -230,6 +230,7 @@ def compute_pead_metrics_from_fundamentals(
     half_life_days: int,
     max_abs_surprise_pct: float,
     max_age_days: int,
+    alpha_factor_spec: str = "legacy",
 ) -> Dict[str, Optional[float]]:
     out: Dict[str, Optional[float]] = {
         "earnings_surprise_pct": None,
@@ -246,6 +247,9 @@ def compute_pead_metrics_from_fundamentals(
     }
 
     today = utc_today_ts()
+    use_v2 = str(alpha_factor_spec).lower() == "v2"
+    effective_half_life_days = max(1.0, float(half_life_days) * (0.75 if use_v2 else 1.0))
+    effective_max_age_days = max(5.0, float(max_age_days) * (0.85 if use_v2 else 1.0))
     chosen_event: Optional[Dict[str, Any]] = None
 
     for item in earnings_history_records(fundamentals):
@@ -284,7 +288,7 @@ def compute_pead_metrics_from_fundamentals(
     clipped_surprise = max(-max_abs_surprise_pct, min(max_abs_surprise_pct, float(surprise_pct)))
     surprise_component = math.tanh(clipped_surprise / 25.0)
     age_days = max(0.0, float((today - report_ts.normalize()).days))
-    decay_component = 0.0 if age_days > float(max_age_days) else 0.5 ** (age_days / max(1.0, float(half_life_days)))
+    decay_component = 0.0 if age_days > effective_max_age_days else 0.5 ** (age_days / effective_half_life_days)
 
     out["pead_surprise_component"] = float(surprise_component)
     out["pead_decay_component"] = float(decay_component)
@@ -1776,6 +1780,144 @@ def compute_accrual_quality_metrics(
     return out
 
 
+def compute_quality_acceleration_metrics_from_fundamentals(
+    fundamentals: Dict[str, Any],
+) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {
+        "quality_acceleration_signal": None,
+        "quality_acceleration_has_coverage": 0.0,
+        "quality_acceleration_measure_count": 0.0,
+        "quality_acceleration_margin_delta": None,
+        "quality_acceleration_return_delta": None,
+        "quality_acceleration_turnover_delta": None,
+        "quality_acceleration_cfo_margin_delta": None,
+        "quality_acceleration_working_capital_delta": None,
+        "quality_acceleration_periodicity": None,
+    }
+
+    matched = _matched_statement_sets(fundamentals, "quarterly")
+    periodicity = 1.0
+    if len(matched) < 3:
+        matched = _matched_statement_sets(fundamentals, "yearly")
+        periodicity = 0.0
+    if len(matched) < 3:
+        return out
+
+    window = list(reversed(matched[:6]))
+    rows: List[Dict[str, float]] = []
+    for idx, entry in enumerate(window):
+        previous = window[idx - 1] if idx > 0 else None
+        income = entry["income"]
+        balance = entry["balance"]
+        cashflow = entry["cashflow"]
+        previous_balance = previous["balance"] if previous is not None else None
+
+        revenue = pick_first(income, "totalRevenue")
+        gross_margin = _gross_margin(income)
+
+        quality_return = None
+        ebit = _ebit_value(income)
+        invested_capital = _effective_invested_capital(balance, intangible_asset=0.0)
+        previous_invested_capital = (
+            _effective_invested_capital(previous_balance, intangible_asset=0.0)
+            if previous_balance is not None
+            else None
+        )
+        average_invested_capital = invested_capital
+        if (
+            invested_capital is not None
+            and previous_invested_capital is not None
+            and (invested_capital + previous_invested_capital) > 0
+        ):
+            average_invested_capital = (invested_capital + previous_invested_capital) / 2.0
+        if ebit is not None and average_invested_capital not in (None, 0):
+            quality_return = _safe_divide(ebit, average_invested_capital)
+
+        if quality_return is None:
+            net_income = pick_first(income, "netIncome")
+            assets = pick_first(balance, "totalAssets")
+            previous_assets = pick_first(previous_balance or {}, "totalAssets")
+            average_assets = assets
+            if assets is not None and previous_assets is not None and (assets + previous_assets) > 0:
+                average_assets = (assets + previous_assets) / 2.0
+            if net_income is not None and average_assets not in (None, 0):
+                quality_return = _safe_divide(net_income, average_assets)
+
+        asset_turnover = _asset_turnover(income, balance, previous_balance)
+        cfo = pick_first(cashflow, "totalCashFromOperatingActivities", "operatingCashFlow")
+        cfo_margin = _safe_divide(cfo, revenue)
+        receivables_to_sales = _safe_divide(
+            pick_first(balance, "netReceivables", "accountsReceivable"),
+            revenue,
+        )
+        inventory_to_sales = _safe_divide(_inventory_value(balance), revenue)
+
+        row = {
+            "gross_margin": float(gross_margin) if gross_margin is not None else np.nan,
+            "quality_return": float(quality_return) if quality_return is not None else np.nan,
+            "asset_turnover": float(asset_turnover) if asset_turnover is not None else np.nan,
+            "cfo_margin": float(cfo_margin) if cfo_margin is not None else np.nan,
+            "receivables_to_sales": float(receivables_to_sales) if receivables_to_sales is not None else np.nan,
+            "inventory_to_sales": float(inventory_to_sales) if inventory_to_sales is not None else np.nan,
+        }
+        if pd.isna(pd.Series(row)).all():
+            continue
+        rows.append(row)
+
+    if len(rows) < 3:
+        return out
+
+    frame = pd.DataFrame(rows)
+
+    def _latest_vs_prior_mean(series: pd.Series) -> Optional[float]:
+        clean = pd.to_numeric(series, errors="coerce").dropna()
+        if len(clean) < 2:
+            return None
+        baseline = float(clean.iloc[-2]) if len(clean) == 2 else float(clean.iloc[:-1].mean())
+        return float(clean.iloc[-1] - baseline)
+
+    margin_delta = _latest_vs_prior_mean(frame["gross_margin"])
+    return_delta = _latest_vs_prior_mean(frame["quality_return"])
+    turnover_delta = _latest_vs_prior_mean(frame["asset_turnover"])
+    cfo_margin_delta = _latest_vs_prior_mean(frame["cfo_margin"])
+    receivables_delta = _latest_vs_prior_mean(frame["receivables_to_sales"])
+    inventory_delta = _latest_vs_prior_mean(frame["inventory_to_sales"])
+
+    working_capital_delta = None
+    wc_components = [
+        float(value)
+        for value in [receivables_delta, inventory_delta]
+        if value is not None
+    ]
+    if wc_components:
+        working_capital_delta = float(sum(wc_components))
+
+    weighted_components = [
+        (0.25, _clip_score(margin_delta, 0.04)),
+        (0.25, _clip_score(return_delta, 0.03)),
+        (0.20, _clip_score(turnover_delta, 0.10)),
+        (0.15, _clip_score(cfo_margin_delta, 0.04)),
+        (0.15, _clip_score(-working_capital_delta, 0.08) if working_capital_delta is not None else None),
+    ]
+    usable_components = [(weight, value) for weight, value in weighted_components if value is not None]
+    if len(usable_components) < 3:
+        return out
+
+    total_weight = float(sum(weight for weight, _ in usable_components))
+    signal = float(sum(weight * float(value) for weight, value in usable_components) / total_weight)
+
+    out["quality_acceleration_signal"] = float(np.clip(signal, -1.0, 1.0))
+    out["quality_acceleration_has_coverage"] = float(min(1.0, total_weight))
+    out["quality_acceleration_measure_count"] = float(len(frame))
+    out["quality_acceleration_margin_delta"] = margin_delta
+    out["quality_acceleration_return_delta"] = return_delta
+    out["quality_acceleration_turnover_delta"] = turnover_delta
+    out["quality_acceleration_cfo_margin_delta"] = cfo_margin_delta
+    out["quality_acceleration_working_capital_delta"] = working_capital_delta
+    out["quality_acceleration_periodicity"] = periodicity
+    return out
+
+
 def compute_revision_impulse_metrics_from_fundamentals(
     fundamentals: Dict[str, Any],
     min_revision_analysts: int,
@@ -1784,6 +1926,11 @@ def compute_revision_impulse_metrics_from_fundamentals(
         "revision_impulse_signal": None,
         "revision_impulse_has_coverage": 0.0,
         "revision_impulse_analyst_count": None,
+        "revision_jerk_signal": None,
+        "revision_jerk_has_coverage": 0.0,
+        "revision_jerk_recent_velocity": None,
+        "revision_jerk_prior_velocity": None,
+        "revision_jerk_component": None,
         "revision_impulse_drift_7d": None,
         "revision_impulse_drift_30d": None,
         "revision_impulse_breadth": None,
@@ -1821,6 +1968,12 @@ def compute_revision_impulse_metrics_from_fundamentals(
         else None
     )
     growth_component = _clip_unit(estimate_growth / 0.25) if estimate_growth is not None else None
+    recent_velocity = _safe_divide((eps_current - eps_7d), denominator) if eps_7d is not None else None
+    prior_velocity = _safe_divide((eps_7d - eps_30d), denominator) if eps_7d is not None and eps_30d is not None else None
+    jerk_component = _clip_score(
+        (recent_velocity - prior_velocity) if recent_velocity is not None and prior_velocity is not None else None,
+        0.08,
+    )
 
     disagreement = (
         _safe_divide((estimate_high - estimate_low), denominator)
@@ -1855,6 +2008,19 @@ def compute_revision_impulse_metrics_from_fundamentals(
     out["revision_impulse_coverage_component"] = float(coverage_component)
     out["revision_impulse_disagreement"] = disagreement
     out["revision_impulse_disagreement_penalty"] = float(disagreement_penalty)
+    out["revision_jerk_recent_velocity"] = recent_velocity
+    out["revision_jerk_prior_velocity"] = prior_velocity
+    out["revision_jerk_component"] = jerk_component
+
+    if jerk_component is not None:
+        jerk_signal = (
+            0.70 * float(jerk_component)
+            + 0.20 * float(breadth or 0.0)
+            + 0.10 * float(growth_component or 0.0)
+        )
+        jerk_signal = jerk_signal * coverage_component * max(0.0, 1.0 - 1.15 * disagreement_penalty)
+        out["revision_jerk_signal"] = max(-1.0, min(1.0, float(jerk_signal)))
+        out["revision_jerk_has_coverage"] = 1.0
     return out
 
 
