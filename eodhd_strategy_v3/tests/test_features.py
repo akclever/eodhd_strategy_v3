@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 import pandas as pd
@@ -385,6 +386,110 @@ def test_compute_fundamental_metrics_wires_revision_jerk_when_enabled() -> None:
     assert metrics["revision_jerk_has_coverage"] == 1.0
 
 
+def test_compute_fundamental_metrics_extracts_short_interest_with_technicals_fallback() -> None:
+    fundamentals = deepcopy(_fundamentals_for_intangible_adjustments())
+    fundamentals["SharesStats"].update(
+        {
+            "SharesOutstanding": 100.0,
+            "SharesFloat": 80.0,
+            "SharesShort": None,
+            "SharesShortPriorMonth": None,
+            "ShortRatio": None,
+            "ShortPercentOutstanding": None,
+            "ShortPercentFloat": None,
+        }
+    )
+    fundamentals["Technicals"].update(
+        {
+            "SharesShort": 12.0,
+            "SharesShortPriorMonth": 10.0,
+            "ShortRatio": 4.0,
+            "ShortPercent": 0.12,
+        }
+    )
+
+    metrics = compute_fundamental_metrics(
+        object(),
+        "ACME.US",
+        fundamentals,
+        "forward",
+        _config(alpha_factor_spec="v2"),
+    )
+
+    assert metrics["short_interest_shares"] == 12.0
+    assert metrics["short_interest_shares_prev"] == 10.0
+    assert metrics["short_interest_ratio"] == 4.0
+    assert metrics["short_interest_pct_float"] == 0.15
+    assert metrics["short_interest_pct_outstanding"] == 0.12
+    assert metrics["short_interest_change"] == 0.2
+
+
+def test_compute_fundamental_metrics_builds_peer_ownership_breadth_input_from_holder_history() -> None:
+    fundamentals = deepcopy(_fundamentals_for_intangible_adjustments())
+    fundamentals["SharesStats"]["PercentInstitutions"] = 55.0
+    fundamentals["Holders"] = {
+        "Institutions": {
+            "0": {"name": "Holder A", "date": "2025-12-31", "totalShares": 3.0},
+            "1": {"name": "Holder B", "date": "2025-12-31", "totalShares": 2.5},
+            "2": {"name": "Holder C", "date": "2025-12-31", "totalShares": 2.0},
+            "3": {"name": "Holder D", "date": "2025-12-31", "totalShares": 1.5},
+            "4": {"name": "Holder E", "date": "2025-12-31", "totalShares": 1.5},
+            "5": {"name": "Holder F", "date": "2025-12-31", "totalShares": 1.0},
+            "6": {"name": "Holder G", "date": "2025-12-31", "totalShares": 1.0},
+            "7": {"name": "Holder H", "date": "2025-12-31", "totalShares": 1.0},
+            "8": {"name": "Prev A", "date": "2025-09-30", "totalShares": 4.0},
+            "9": {"name": "Prev B", "date": "2025-09-30", "totalShares": 3.0},
+            "10": {"name": "Prev C", "date": "2025-09-30", "totalShares": 2.5},
+            "11": {"name": "Prev D", "date": "2025-09-30", "totalShares": 2.0},
+            "12": {"name": "Prev E", "date": "2025-09-30", "totalShares": 1.5},
+        }
+    }
+
+    metrics = compute_fundamental_metrics(
+        object(),
+        "ACME.US",
+        fundamentals,
+        "forward",
+        _config(alpha_factor_spec="v2", use_peer_relative_anomalies=True),
+    )
+
+    assert metrics["percent_institutions"] == 0.55
+    assert metrics["institution_holder_count_latest"] == 8.0
+    assert metrics["institution_holder_count_prev"] == 5.0
+    assert metrics["institutional_breadth_delta"] is not None
+    assert metrics["institutional_breadth_delta"] > 0
+    assert metrics["institutional_ownership_delta"] is not None
+    assert metrics["institutional_ownership_delta"] > 0
+    assert metrics["institutional_top5_concentration_delta"] is not None
+    assert metrics["institutional_top5_concentration_delta"] < 0
+    assert metrics["peer_ownership_breadth_input"] is not None
+    assert metrics["peer_ownership_breadth_input"] > 0
+
+
+def test_compute_fundamental_metrics_keeps_peer_ownership_input_null_without_prior_holder_date() -> None:
+    fundamentals = deepcopy(_fundamentals_for_intangible_adjustments())
+    fundamentals["Holders"] = {
+        "Institutions": {
+            "0": {"name": "Holder A", "date": "2025-12-31", "totalShares": 3.0},
+            "1": {"name": "Holder B", "date": "2025-12-31", "totalShares": 2.0},
+            "2": {"name": "Holder C", "date": "2025-12-31", "totalShares": 1.0},
+        }
+    }
+
+    metrics = compute_fundamental_metrics(
+        object(),
+        "ACME.US",
+        fundamentals,
+        "forward",
+        _config(alpha_factor_spec="v2", use_peer_relative_anomalies=True),
+    )
+
+    assert metrics["institution_holder_count_latest"] == 3.0
+    assert metrics["institution_holder_count_prev"] is None
+    assert metrics["institutional_breadth_delta"] is None
+    assert metrics["peer_ownership_breadth_input"] is None
+
+
 def test_news_theme_drift_and_insider_metrics_stay_neutral_without_coverage() -> None:
     class EmptyClient:
         def get_news(self, **kwargs):
@@ -502,3 +607,73 @@ def test_news_theme_drift_v2_and_insider_v2_use_revision_support() -> None:
     assert news_metrics["news_theme_drift_signal"] > 0
     assert insider_metrics["insider_conviction_signal"] is not None
     assert insider_metrics["insider_conviction_signal"] > 0
+
+
+def test_insider_conviction_v2_uses_ownership_confirmation_and_short_crowding_penalty() -> None:
+    today = pd.Timestamp.now(tz="UTC").normalize()
+
+    class FakeClient:
+        def get_insider_transactions(self, **kwargs):
+            return [
+                {
+                    "date": (today - pd.Timedelta(days=7)).isoformat(),
+                    "transactionCode": "P",
+                    "transactionAmount": 10000,
+                    "transactionPrice": 10.0,
+                    "ownerName": "Jane Doe",
+                    "officerTitle": "Chief Executive Officer",
+                },
+                {
+                    "date": (today - pd.Timedelta(days=14)).isoformat(),
+                    "transactionCode": "P",
+                    "transactionAmount": 5000,
+                    "transactionPrice": 10.0,
+                    "ownerName": "John Doe",
+                    "officerTitle": "Chief Financial Officer",
+                },
+            ]
+
+    base_v2 = compute_insider_conviction_metrics(
+        FakeClient(),
+        "ACME.US",
+        alpha_factor_spec="v2",
+        revision_support=0.4,
+        ownership_support=None,
+        short_interest_change=0.0,
+    )
+    confirmed_v2 = compute_insider_conviction_metrics(
+        FakeClient(),
+        "ACME.US",
+        alpha_factor_spec="v2",
+        revision_support=0.4,
+        ownership_support=0.8,
+        short_interest_change=0.0,
+    )
+    crowded_v2 = compute_insider_conviction_metrics(
+        FakeClient(),
+        "ACME.US",
+        alpha_factor_spec="v2",
+        revision_support=0.4,
+        ownership_support=0.8,
+        short_interest_change=0.5,
+    )
+    legacy = compute_insider_conviction_metrics(
+        FakeClient(),
+        "ACME.US",
+        alpha_factor_spec="legacy",
+        revision_support=0.4,
+        ownership_support=0.8,
+        short_interest_change=0.5,
+    )
+
+    assert confirmed_v2["insider_ownership_confirmation_component"] is not None
+    assert confirmed_v2["insider_ownership_confirmation_component"] > 0
+    assert crowded_v2["insider_short_crowding_penalty"] is not None
+    assert crowded_v2["insider_short_crowding_penalty"] > 0
+    assert confirmed_v2["insider_conviction_signal"] is not None
+    assert base_v2["insider_conviction_signal"] is not None
+    assert crowded_v2["insider_conviction_signal"] is not None
+    assert confirmed_v2["insider_conviction_signal"] > base_v2["insider_conviction_signal"]
+    assert crowded_v2["insider_conviction_signal"] < confirmed_v2["insider_conviction_signal"]
+    assert legacy["insider_ownership_confirmation_component"] is None
+    assert legacy["insider_short_crowding_penalty"] is None

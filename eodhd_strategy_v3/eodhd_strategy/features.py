@@ -15,6 +15,7 @@ from .advanced_factors import (
     compute_capital_allocation_quality_metrics,
     compute_compounder_persistence_metrics_from_fundamentals,
     compute_estimate_term_structure_metrics_from_fundamentals,
+    compute_institutional_breadth_metrics_from_fundamentals,
     compute_investment_restraint_metrics,
     compute_pead_metrics_from_fundamentals,
     compute_price_momentum_metrics_from_history,
@@ -25,7 +26,10 @@ from .advanced_factors import (
     compute_recovery_fundamental_metrics,
     compute_revenue_growth_metrics_from_fundamentals,
     compute_revision_impulse_metrics_from_fundamentals,
+    compute_share_drift_metrics_from_fundamentals,
+    compute_short_interest_metrics_from_fundamentals,
     compute_sue_metrics_from_fundamentals,
+    compute_turnover_day_metrics_from_fundamentals,
     compute_working_capital_stress_metrics,
     income_statement_records,
     passes_sentiment_coverage_gate,
@@ -281,22 +285,12 @@ def compute_trailing_dividend_cash_per_share(client: EODHDClient, symbol: str) -
     return total if total > 0 else None
 
 
-def compute_buyback_yield(fundamentals: Dict[str, Any]) -> Optional[float]:
-    records = balance_sheet_records(fundamentals)
-    if len(records) >= 2:
-        current_shares = pick_first(records[0], "commonStockSharesOutstanding")
-        previous_shares = pick_first(records[1], "commonStockSharesOutstanding")
-        if current_shares and previous_shares and current_shares > 0 and previous_shares > 0:
-            return 1.0 - (current_shares / previous_shares)
-
-    annual_records = annual_outstanding_share_records(fundamentals)
-    if len(annual_records) >= 2:
-        current_shares = pick_first(annual_records[0], "shares", "sharesMln")
-        previous_shares = pick_first(annual_records[1], "shares", "sharesMln")
-        if current_shares and previous_shares and current_shares > 0 and previous_shares > 0:
-            return 1.0 - (current_shares / previous_shares)
-
-    return None
+def compute_buyback_yield(fundamentals: Dict[str, Any], alpha_factor_spec: str = "legacy") -> Optional[float]:
+    metrics = compute_share_drift_metrics_from_fundamentals(
+        fundamentals,
+        alpha_factor_spec=alpha_factor_spec,
+    )
+    return to_float(metrics.get("buyback_yield"))
 
 
 def compute_sentiment_metrics(client: EODHDClient, symbol: str, lookback_days: int) -> Dict[str, Optional[float]]:
@@ -729,6 +723,8 @@ def compute_insider_conviction_metrics(
     lookback_days: int = 90,
     alpha_factor_spec: str = "legacy",
     revision_support: Optional[float] = None,
+    ownership_support: Optional[float] = None,
+    short_interest_change: Optional[float] = None,
 ) -> Dict[str, Optional[float]]:
     empty_result = {
         "insider_conviction_signal": None,
@@ -738,6 +734,8 @@ def compute_insider_conviction_metrics(
         "insider_conviction_trade_count": 0.0,
         "insider_conviction_buy_person_count": 0.0,
         "insider_conviction_sell_person_count": 0.0,
+        "insider_ownership_confirmation_component": None,
+        "insider_short_crowding_penalty": None,
         "insider_fetch_status": "empty",
         "insider_fetch_error": 0.0,
         "insider_fetch_error_type": None,
@@ -832,9 +830,20 @@ def compute_insider_conviction_metrics(
         sell_pressure = float(np.tanh(max(0.0, sell_ratio - sell_ratio_threshold / 2.0)) * sell_cluster)
 
     signal = float(np.clip(1.05 * buy_strength - 0.55 * sell_pressure, -1.0, 1.0))
+    ownership_confirmation_component = None
+    short_crowding_penalty = None
     if use_v2:
         revision_boost = 0.15 * max(0.0, float(np.clip(revision_support or 0.0, -1.0, 1.0)))
         signal = float(np.clip(signal + revision_boost, -1.0, 1.0))
+        if len(buy_people) >= 2 and ownership_support is not None:
+            ownership_confirmation_component = 0.20 * float(np.clip(float(ownership_support), -1.0, 1.0))
+            signal = float(np.clip(signal + ownership_confirmation_component, -1.0, 1.0))
+        if weighted_buy > 0:
+            short_crowding_penalty = 0.10 * max(
+                0.0,
+                float(np.clip(float(short_interest_change or 0.0) / 0.25, -1.0, 1.0)),
+            )
+            signal = float(np.clip(signal - short_crowding_penalty, -1.0, 1.0))
     coverage = float(np.clip(valid_trade_count / (4.0 if use_v2 else 3.0), 0.0, 1.0))
     return {
         "insider_conviction_signal": signal,
@@ -844,6 +853,8 @@ def compute_insider_conviction_metrics(
         "insider_conviction_trade_count": float(valid_trade_count),
         "insider_conviction_buy_person_count": float(len(buy_people)),
         "insider_conviction_sell_person_count": float(len(sell_people)),
+        "insider_ownership_confirmation_component": ownership_confirmation_component,
+        "insider_short_crowding_penalty": short_crowding_penalty,
         "insider_fetch_status": "ok",
         "insider_fetch_error": 0.0,
         "insider_fetch_error_type": None,
@@ -1147,11 +1158,41 @@ def compute_fundamental_metrics(
     if shares_outstanding is None:
         shares_outstanding = pick_first(shares_stats, "SharesOutstanding")
     previous_shares = pick_first(previous_balance, "commonStockSharesOutstanding")
+    short_interest_metrics = compute_short_interest_metrics_from_fundamentals(fundamentals)
+    institutional_breadth_metrics = compute_institutional_breadth_metrics_from_fundamentals(fundamentals)
+    share_drift_metrics = compute_share_drift_metrics_from_fundamentals(
+        fundamentals,
+        alpha_factor_spec=alpha_factor_spec,
+    )
+    turnover_day_metrics = compute_turnover_day_metrics_from_fundamentals(fundamentals)
+
     share_count_discipline_input = (
         (float(previous_shares) - float(shares_outstanding)) / max(abs(float(previous_shares)), 1.0)
         if shares_outstanding is not None and previous_shares not in (None, 0)
         else None
     )
+    if alpha_factor_spec == "v2":
+        share_count_discipline_input = (
+            to_float(share_drift_metrics.get("share_drift_4q"))
+            if share_drift_metrics.get("share_drift_4q") is not None
+            else to_float(share_drift_metrics.get("share_drift_1q"))
+        )
+
+    peer_ownership_breadth_input = None
+    if institutional_breadth_metrics.get("institution_holder_count_prev") is not None:
+        ownership_components: list[float] = []
+        breadth_delta = to_float(institutional_breadth_metrics.get("institutional_breadth_delta"))
+        ownership_delta = to_float(institutional_breadth_metrics.get("institutional_ownership_delta"))
+        concentration_delta = to_float(institutional_breadth_metrics.get("institutional_top5_concentration_delta"))
+        if breadth_delta is not None:
+            ownership_components.append(float(np.clip(breadth_delta / 0.20, -1.0, 1.0)))
+        if ownership_delta is not None:
+            ownership_components.append(float(np.clip(ownership_delta / 0.05, -1.0, 1.0)))
+        if concentration_delta is not None:
+            ownership_components.append(float(np.clip(-concentration_delta / 0.10, -1.0, 1.0)))
+        if len(ownership_components) >= 2:
+            peer_ownership_breadth_input = float(sum(ownership_components) / len(ownership_components))
+
     price_proxy = (
         market_cap / shares_outstanding
         if market_cap and shares_outstanding and shares_outstanding > 0
@@ -1184,7 +1225,7 @@ def compute_fundamental_metrics(
                 else None
             )
 
-    buyback_yield = compute_buyback_yield(fundamentals)
+    buyback_yield = compute_buyback_yield(fundamentals, alpha_factor_spec=alpha_factor_spec)
     payout_ratio = pick_first(highlights, "PayoutRatio")
     piotroski_score = compute_piotroski_f_score(fundamentals)
 
@@ -1246,6 +1287,35 @@ def compute_fundamental_metrics(
         "international_domestic": general.get("InternationalDomestic"),
         "payout_ratio": payout_ratio,
         "shares_outstanding": shares_outstanding,
+        "short_interest_shares": short_interest_metrics.get("short_interest_shares"),
+        "short_interest_shares_prev": short_interest_metrics.get("short_interest_shares_prev"),
+        "short_interest_ratio": short_interest_metrics.get("short_interest_ratio"),
+        "short_interest_pct_float": short_interest_metrics.get("short_interest_pct_float"),
+        "short_interest_pct_outstanding": short_interest_metrics.get("short_interest_pct_outstanding"),
+        "short_interest_change": short_interest_metrics.get("short_interest_change"),
+        "percent_institutions": institutional_breadth_metrics.get("percent_institutions"),
+        "institution_holder_count_latest": institutional_breadth_metrics.get("institution_holder_count_latest"),
+        "institution_holder_count_prev": institutional_breadth_metrics.get("institution_holder_count_prev"),
+        "institutional_breadth_delta": institutional_breadth_metrics.get("institutional_breadth_delta"),
+        "institutional_ownership_from_holders": institutional_breadth_metrics.get("institutional_ownership_from_holders"),
+        "institutional_ownership_delta": institutional_breadth_metrics.get("institutional_ownership_delta"),
+        "institutional_top5_concentration_delta": institutional_breadth_metrics.get("institutional_top5_concentration_delta"),
+        "share_drift_1q": share_drift_metrics.get("share_drift_1q"),
+        "share_drift_4q": share_drift_metrics.get("share_drift_4q"),
+        "share_drift_persistence": share_drift_metrics.get("share_drift_persistence"),
+        "receivables_days": turnover_day_metrics.get("receivables_days"),
+        "receivables_days_prev": turnover_day_metrics.get("receivables_days_prev"),
+        "receivables_days_delta": turnover_day_metrics.get("receivables_days_delta"),
+        "inventory_days": turnover_day_metrics.get("inventory_days"),
+        "inventory_days_prev": turnover_day_metrics.get("inventory_days_prev"),
+        "inventory_days_delta": turnover_day_metrics.get("inventory_days_delta"),
+        "payables_days": turnover_day_metrics.get("payables_days"),
+        "payables_days_prev": turnover_day_metrics.get("payables_days_prev"),
+        "payables_days_delta": turnover_day_metrics.get("payables_days_delta"),
+        "cash_conversion_cycle_days": turnover_day_metrics.get("cash_conversion_cycle_days"),
+        "cash_conversion_cycle_days_prev": turnover_day_metrics.get("cash_conversion_cycle_days_prev"),
+        "cash_conversion_cycle_days_delta": turnover_day_metrics.get("cash_conversion_cycle_days_delta"),
+        "cash_conversion_cycle_convexity": turnover_day_metrics.get("cash_conversion_cycle_convexity"),
         "price_proxy": price_proxy,
         "52_week_high": high_52,
         "200_day_ma": ma200,
@@ -1262,6 +1332,7 @@ def compute_fundamental_metrics(
         "peer_reinvestment_efficiency_input": peer_reinvestment_efficiency_input,
         "peer_estimate_drift_input": None,
         "peer_dilution_discipline_input": share_count_discipline_input,
+        "peer_ownership_breadth_input": peer_ownership_breadth_input,
         "earnings_surprise_pct": None,
         "earnings_report_date": None,
         "pead_signal": None,
@@ -1294,6 +1365,12 @@ def compute_fundamental_metrics(
         "revision_impulse_coverage_component": None,
         "revision_impulse_disagreement": None,
         "revision_impulse_disagreement_penalty": None,
+        "revision_short_divergence_component": None,
+        "revision_breadth_7d": None,
+        "revision_breadth_30d": None,
+        "revision_breadth_acceleration": None,
+        "float_absorption_signal": None,
+        "squeeze_convexity_signal": None,
         "estimate_term_structure_signal": None,
         "estimate_term_structure_has_coverage": 0.0,
         "estimate_term_structure_record_count": 0.0,
@@ -1337,6 +1414,7 @@ def compute_fundamental_metrics(
         "working_capital_inventory_stress": None,
         "working_capital_payables_stress": None,
         "working_capital_cfo_stress": None,
+        "working_capital_cycle_stress": None,
         "investment_restraint_signal": None,
         "investment_restraint_has_coverage": 0.0,
         "investment_restraint_measure_count": 0.0,
@@ -1356,6 +1434,7 @@ def compute_fundamental_metrics(
         "accrual_quality_cash_conversion": None,
         "accrual_quality_margin_gap": None,
         "accrual_quality_working_capital_stretch": None,
+        "accrual_quality_cycle_convexity": None,
         "quality_acceleration_signal": None,
         "quality_acceleration_has_coverage": 0.0,
         "quality_acceleration_measure_count": 0.0,
@@ -1372,6 +1451,12 @@ def compute_fundamental_metrics(
         "capital_allocation_debt_component": None,
         "capital_allocation_payout_component": None,
         "capital_allocation_reinvestment_component": None,
+        "capital_allocation_financing_dependency_component": None,
+        "financing_dependency_stress": None,
+        "financing_dependency_burn_component": None,
+        "financing_dependency_dilution_component": None,
+        "financing_dependency_debt_component": None,
+        "financing_dependency_revision_component": None,
         "recovery_margin_inflection": None,
         "recovery_leverage_improvement": None,
         "recovery_accrual_improvement": None,
@@ -1382,6 +1467,7 @@ def compute_fundamental_metrics(
         "peer_relative_reinvestment_component": None,
         "peer_relative_estimate_component": None,
         "peer_relative_dilution_component": None,
+        "peer_relative_ownership_component": None,
     }
 
     if config.use_pead:
@@ -1402,6 +1488,7 @@ def compute_fundamental_metrics(
             compute_revision_impulse_metrics_from_fundamentals(
                 fundamentals,
                 min_revision_analysts=config.min_revision_analysts,
+                alpha_factor_spec=alpha_factor_spec,
             )
         )
 
@@ -1485,10 +1572,20 @@ def compute_fundamental_metrics(
         metrics.update(compute_investment_restraint_metrics(fundamentals))
 
     if getattr(config, "use_accrual_quality", False):
-        metrics.update(compute_accrual_quality_metrics(fundamentals))
+        metrics.update(
+            compute_accrual_quality_metrics(
+                fundamentals,
+                alpha_factor_spec=alpha_factor_spec,
+            )
+        )
 
     if getattr(config, "use_quality_acceleration", False):
-        metrics.update(compute_quality_acceleration_metrics_from_fundamentals(fundamentals))
+        metrics.update(
+            compute_quality_acceleration_metrics_from_fundamentals(
+                fundamentals,
+                alpha_factor_spec=alpha_factor_spec,
+            )
+        )
 
     if getattr(config, "use_capital_allocation_quality", False):
         metrics.update(
@@ -1627,6 +1724,8 @@ def add_overlay_metrics(client: EODHDClient, row: Dict[str, Any], config: Ranker
                 symbol,
                 alpha_factor_spec=str(getattr(config, "alpha_factor_spec", "legacy") or "legacy"),
                 revision_support=to_float(out.get("revision_impulse_signal")),
+                ownership_support=to_float(out.get("peer_ownership_breadth_input")),
+                short_interest_change=to_float(out.get("short_interest_change")),
             )
         )
     else:
@@ -1637,6 +1736,8 @@ def add_overlay_metrics(client: EODHDClient, row: Dict[str, Any], config: Ranker
         out.setdefault("insider_conviction_trade_count", 0.0)
         out.setdefault("insider_conviction_buy_person_count", 0.0)
         out.setdefault("insider_conviction_sell_person_count", 0.0)
+        out.setdefault("insider_ownership_confirmation_component", None)
+        out.setdefault("insider_short_crowding_penalty", None)
         out.setdefault("insider_fetch_status", "not_requested")
         out.setdefault("insider_fetch_error", 0.0)
         out.setdefault("insider_fetch_error_type", None)

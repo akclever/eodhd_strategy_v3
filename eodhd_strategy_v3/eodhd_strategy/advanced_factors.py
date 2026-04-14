@@ -36,6 +36,12 @@ def cash_flow_records(fundamentals: Dict[str, Any], frequency: str = "yearly") -
     return _statement_records(fundamentals, "Cash_Flow", frequency)
 
 
+def outstanding_share_records(fundamentals: Dict[str, Any], frequency: str = "yearly") -> List[Dict[str, Any]]:
+    outstanding = fundamentals.get("outstandingShares") or {}
+    section = outstanding.get(frequency) if isinstance(outstanding, dict) else None
+    return normalize_records(section)
+
+
 def _matched_statement_sets(fundamentals: Dict[str, Any], frequency: str) -> List[Dict[str, Any]]:
     income = {_record_key(rec): rec for rec in income_statement_records(fundamentals, frequency)}
     balance = {_record_key(rec): rec for rec in balance_sheet_records(fundamentals, frequency)}
@@ -161,11 +167,401 @@ def latest_earnings_trend_record(fundamentals: Dict[str, Any]) -> Optional[Dict[
                 "epsTrend7daysAgo",
                 "epsTrend30daysAgo",
                 "epsRevisionsUpLast7days",
+                "epsRevisionsDownLast7days",
+                "epsRevisionsUpLast30days",
                 "epsRevisionsDownLast30days",
             ]
         ):
             return record
     return None
+
+
+def _percentage_points_to_fraction(value: Any) -> Optional[float]:
+    numeric = to_float(value)
+    if numeric is None:
+        return None
+    return float(numeric) / 100.0
+
+
+def _first_present_numeric(mapping: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = to_float(mapping.get(key))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _latest_share_count(fundamentals: Dict[str, Any]) -> Optional[float]:
+    quarterly_history = _share_count_history(fundamentals, "quarterly")
+    if quarterly_history:
+        return float(quarterly_history[0]["shares"])
+    yearly_history = _share_count_history(fundamentals, "yearly")
+    if yearly_history:
+        return float(yearly_history[0]["shares"])
+    return None
+
+
+def compute_short_interest_metrics_from_fundamentals(fundamentals: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {
+        "short_interest_shares": None,
+        "short_interest_shares_prev": None,
+        "short_interest_ratio": None,
+        "short_interest_pct_float": None,
+        "short_interest_pct_outstanding": None,
+        "short_interest_change": None,
+    }
+
+    shares_stats = fundamentals.get("SharesStats") or {}
+    technicals = fundamentals.get("Technicals") or {}
+
+    shares = _first_present_numeric(shares_stats, "SharesShort")
+    if shares is None:
+        shares = _first_present_numeric(technicals, "SharesShort")
+    previous_shares = _first_present_numeric(shares_stats, "SharesShortPriorMonth")
+    if previous_shares is None:
+        previous_shares = _first_present_numeric(technicals, "SharesShortPriorMonth")
+    short_ratio = _first_present_numeric(shares_stats, "ShortRatio")
+    if short_ratio is None:
+        short_ratio = _first_present_numeric(technicals, "ShortRatio")
+    short_pct_float = _first_present_numeric(shares_stats, "ShortPercentFloat")
+    short_pct_outstanding = _first_present_numeric(shares_stats, "ShortPercentOutstanding")
+    if short_pct_outstanding is None:
+        short_pct_outstanding = _first_present_numeric(technicals, "ShortPercent")
+
+    shares_float = _first_present_numeric(shares_stats, "SharesFloat")
+    shares_outstanding = _first_present_numeric(shares_stats, "SharesOutstanding")
+    if shares_outstanding is None:
+        shares_outstanding = _latest_share_count(fundamentals)
+
+    if short_pct_float is None and shares is not None and shares_float not in (None, 0):
+        short_pct_float = float(shares) / max(abs(float(shares_float)), 1.0)
+    if short_pct_outstanding is None and shares is not None and shares_outstanding not in (None, 0):
+        short_pct_outstanding = float(shares) / max(abs(float(shares_outstanding)), 1.0)
+
+    short_interest_change = _safe_divide(
+        (shares - previous_shares) if shares is not None and previous_shares is not None else None,
+        abs(float(previous_shares)) if previous_shares not in (None, 0) else None,
+    )
+
+    out["short_interest_shares"] = shares
+    out["short_interest_shares_prev"] = previous_shares
+    out["short_interest_ratio"] = short_ratio
+    out["short_interest_pct_float"] = short_pct_float
+    out["short_interest_pct_outstanding"] = short_pct_outstanding
+    out["short_interest_change"] = short_interest_change
+    return out
+
+
+def _holder_records(fundamentals: Dict[str, Any], holder_type: str) -> List[Dict[str, Any]]:
+    holders = fundamentals.get("Holders") or {}
+    section = holders.get(holder_type) if isinstance(holders, dict) else None
+    return normalize_records(section)
+
+
+def _holder_groups_by_date(records: List[Dict[str, Any]]) -> List[tuple[pd.Timestamp, List[Dict[str, Any]]]]:
+    grouped: dict[pd.Timestamp, List[Dict[str, Any]]] = {}
+    for record in records:
+        date = pd.to_datetime(record.get("date"), errors="coerce")
+        if pd.isna(date):
+            continue
+        key = pd.Timestamp(date).normalize()
+        grouped.setdefault(key, []).append(record)
+    return sorted(grouped.items(), key=lambda item: item[0], reverse=True)
+
+
+def _holder_total_share_fraction(records: List[Dict[str, Any]]) -> float:
+    total = 0.0
+    for record in records:
+        total_shares = _percentage_points_to_fraction(record.get("totalShares"))
+        if total_shares is not None:
+            total += float(total_shares)
+    return total
+
+
+def _holder_top_n_concentration(records: List[Dict[str, Any]], n: int = 5) -> float:
+    weights = [
+        float(weight)
+        for weight in (_percentage_points_to_fraction(record.get("totalShares")) for record in records)
+        if weight is not None
+    ]
+    weights.sort(reverse=True)
+    return float(sum(weights[:n]))
+
+
+def compute_institutional_breadth_metrics_from_fundamentals(
+    fundamentals: Dict[str, Any],
+) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {
+        "percent_institutions": _percentage_points_to_fraction((fundamentals.get("SharesStats") or {}).get("PercentInstitutions")),
+        "institution_holder_count_latest": None,
+        "institution_holder_count_prev": None,
+        "institutional_breadth_delta": None,
+        "institutional_ownership_from_holders": None,
+        "institutional_ownership_delta": None,
+        "institutional_top5_concentration_delta": None,
+    }
+
+    records = _holder_records(fundamentals, "Institutions")
+    if not records:
+        records = _holder_records(fundamentals, "Funds")
+    if not records:
+        return out
+
+    grouped_records = _holder_groups_by_date(records)
+    latest_rows = grouped_records[0][1]
+    out["institution_holder_count_latest"] = float(len(latest_rows))
+    out["institutional_ownership_from_holders"] = _holder_total_share_fraction(latest_rows)
+
+    if len(grouped_records) < 2:
+        return out
+
+    previous_rows = grouped_records[1][1]
+    prev_count = float(len(previous_rows))
+    latest_count = float(len(latest_rows))
+    ownership_latest = _holder_total_share_fraction(latest_rows)
+    ownership_prev = _holder_total_share_fraction(previous_rows)
+    top5_latest = _holder_top_n_concentration(latest_rows)
+    top5_prev = _holder_top_n_concentration(previous_rows)
+
+    out["institution_holder_count_prev"] = prev_count
+    out["institutional_breadth_delta"] = _safe_divide(latest_count - prev_count, max(prev_count, 1.0))
+    out["institutional_ownership_delta"] = float(ownership_latest - ownership_prev)
+    out["institutional_top5_concentration_delta"] = float(top5_latest - top5_prev)
+    return out
+
+
+def _share_count_history(fundamentals: Dict[str, Any], frequency: str) -> List[Dict[str, float]]:
+    preferred_records = outstanding_share_records(fundamentals, frequency)
+    fallback_records = balance_sheet_records(fundamentals, frequency)
+    records = preferred_records if preferred_records else fallback_records
+
+    history: List[Dict[str, float]] = []
+    seen_dates: set[pd.Timestamp] = set()
+    for record in records:
+        date = pd.to_datetime(_record_key(record), errors="coerce")
+        shares = _share_count_from_record(record)
+        if pd.isna(date) or shares is None or shares <= 0:
+            continue
+        normalized_date = pd.Timestamp(date).normalize()
+        if normalized_date in seen_dates:
+            continue
+        seen_dates.add(normalized_date)
+        history.append({"date": normalized_date, "shares": float(shares)})
+    return history
+
+
+def _share_drift(current_shares: Optional[float], previous_shares: Optional[float]) -> Optional[float]:
+    if current_shares is None or previous_shares in (None, 0):
+        return None
+    return (float(previous_shares) - float(current_shares)) / max(abs(float(previous_shares)), 1.0)
+
+
+def compute_share_drift_metrics_from_fundamentals(
+    fundamentals: Dict[str, Any],
+    alpha_factor_spec: str = "legacy",
+) -> Dict[str, Optional[float]]:
+    quarterly_history = _share_count_history(fundamentals, "quarterly")
+    yearly_history = _share_count_history(fundamentals, "yearly")
+
+    share_drift_1q = None
+    if len(quarterly_history) >= 2:
+        share_drift_1q = _share_drift(quarterly_history[0]["shares"], quarterly_history[1]["shares"])
+
+    share_drift_4q = None
+    if len(quarterly_history) >= 5:
+        share_drift_4q = _share_drift(quarterly_history[0]["shares"], quarterly_history[4]["shares"])
+    elif len(yearly_history) >= 2:
+        share_drift_4q = _share_drift(yearly_history[0]["shares"], yearly_history[1]["shares"])
+
+    persistence = None
+    available_quarterly_transitions = min(4, max(0, len(quarterly_history) - 1))
+    if available_quarterly_transitions > 0:
+        positive_quarters = 0
+        for idx in range(available_quarterly_transitions):
+            drift = _share_drift(quarterly_history[idx]["shares"], quarterly_history[idx + 1]["shares"])
+            if drift is not None and drift > 0:
+                positive_quarters += 1
+        persistence = float(positive_quarters / available_quarterly_transitions)
+
+    legacy_buyback_yield = None
+    if len(yearly_history) >= 2:
+        legacy_buyback_yield = _share_drift(yearly_history[0]["shares"], yearly_history[1]["shares"])
+    elif share_drift_1q is not None:
+        legacy_buyback_yield = share_drift_1q
+
+    buyback_yield = legacy_buyback_yield
+    if str(alpha_factor_spec).lower() == "v2":
+        weighted_components: List[tuple[float, float]] = []
+        if share_drift_4q is not None:
+            weighted_components.append((0.70, float(share_drift_4q)))
+        if share_drift_1q is not None:
+            weighted_components.append((0.30, float(share_drift_1q)))
+        if weighted_components:
+            total_weight = float(sum(weight for weight, _ in weighted_components))
+            buyback_yield = float(sum(weight * value for weight, value in weighted_components) / total_weight)
+
+    return {
+        "buyback_yield": buyback_yield,
+        "share_drift_1q": share_drift_1q,
+        "share_drift_4q": share_drift_4q,
+        "share_drift_persistence": persistence,
+    }
+
+
+def _cost_of_revenue_value(income: Dict[str, Any]) -> Optional[float]:
+    cost_of_revenue = pick_first(income, "costOfRevenue")
+    if cost_of_revenue is None:
+        revenue = pick_first(income, "totalRevenue")
+        gross_profit = pick_first(income, "grossProfit")
+        if revenue is not None and gross_profit is not None:
+            cost_of_revenue = float(revenue - gross_profit)
+    if cost_of_revenue is None:
+        return None
+    return abs(float(cost_of_revenue)) if abs(float(cost_of_revenue)) > 1e-12 else None
+
+
+def _average_balance(current_value: Optional[float], previous_value: Optional[float]) -> Optional[float]:
+    if current_value is None:
+        return None
+    if previous_value is None:
+        return float(current_value)
+    return float(current_value + previous_value) / 2.0
+
+
+def _turnover_days_from_entry(
+    income: Dict[str, Any],
+    balance: Dict[str, Any],
+    previous_balance: Optional[Dict[str, Any]],
+    period_days: float,
+) -> Dict[str, Optional[float]]:
+    revenue = pick_first(income, "totalRevenue")
+    cost_of_revenue = _cost_of_revenue_value(income)
+
+    receivables = pick_first(balance, "netReceivables", "accountsReceivable")
+    previous_receivables = pick_first(previous_balance or {}, "netReceivables", "accountsReceivable")
+    inventory = _inventory_value(balance)
+    previous_inventory = _inventory_value(previous_balance or {})
+    payables = _accounts_payable_value(balance)
+    previous_payables = _accounts_payable_value(previous_balance or {})
+
+    receivables_days = None
+    average_receivables = _average_balance(receivables, previous_receivables)
+    if average_receivables is not None and revenue not in (None, 0):
+        receivables_days = float(average_receivables / max(abs(float(revenue)), 1.0) * float(period_days))
+
+    inventory_days = None
+    average_inventory = _average_balance(inventory, previous_inventory)
+    if average_inventory is not None and cost_of_revenue not in (None, 0):
+        inventory_days = float(average_inventory / max(abs(float(cost_of_revenue)), 1.0) * float(period_days))
+
+    payables_days = None
+    average_payables = _average_balance(payables, previous_payables)
+    if average_payables is not None and cost_of_revenue not in (None, 0):
+        payables_days = float(average_payables / max(abs(float(cost_of_revenue)), 1.0) * float(period_days))
+
+    return {
+        "receivables_days": receivables_days,
+        "inventory_days": inventory_days,
+        "payables_days": payables_days,
+    }
+
+
+def _cash_conversion_cycle_days(
+    receivables_days: Optional[float],
+    inventory_days: Optional[float],
+    payables_days: Optional[float],
+) -> Optional[float]:
+    if receivables_days is None or inventory_days is None or payables_days is None:
+        return None
+    return float(receivables_days + inventory_days - payables_days)
+
+
+def compute_turnover_day_metrics_from_fundamentals(fundamentals: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {
+        "receivables_days": None,
+        "receivables_days_prev": None,
+        "receivables_days_delta": None,
+        "inventory_days": None,
+        "inventory_days_prev": None,
+        "inventory_days_delta": None,
+        "payables_days": None,
+        "payables_days_prev": None,
+        "payables_days_delta": None,
+        "cash_conversion_cycle_days": None,
+        "cash_conversion_cycle_days_prev": None,
+        "cash_conversion_cycle_days_delta": None,
+        "cash_conversion_cycle_convexity": None,
+    }
+
+    matched = _matched_statement_sets(fundamentals, "quarterly")
+    period_days = 90.0
+    if len(matched) < 2:
+        matched = _matched_statement_sets(fundamentals, "yearly")
+        period_days = 365.0
+    if len(matched) < 2:
+        return out
+
+    current = matched[0]
+    previous = matched[1]
+    earlier = matched[2] if len(matched) >= 3 else None
+    earlier_balance = earlier["balance"] if earlier is not None else None
+    earliest_balance = matched[3]["balance"] if len(matched) >= 4 else None
+
+    current_days = _turnover_days_from_entry(
+        current["income"],
+        current["balance"],
+        previous["balance"],
+        period_days,
+    )
+    previous_days = _turnover_days_from_entry(
+        previous["income"],
+        previous["balance"],
+        earlier_balance,
+        period_days,
+    )
+    earlier_days = (
+        _turnover_days_from_entry(
+            earlier["income"],
+            earlier["balance"],
+            earliest_balance,
+            period_days,
+        )
+        if earlier is not None and earliest_balance is not None
+        else {}
+    )
+
+    for key in ["receivables_days", "inventory_days", "payables_days"]:
+        current_value = current_days.get(key)
+        previous_value = previous_days.get(key)
+        out[key] = current_value
+        out[f"{key}_prev"] = previous_value
+        if current_value is not None and previous_value is not None:
+            out[f"{key}_delta"] = float(current_value - previous_value)
+
+    current_cycle = _cash_conversion_cycle_days(
+        out.get("receivables_days"),
+        out.get("inventory_days"),
+        out.get("payables_days"),
+    )
+    previous_cycle = _cash_conversion_cycle_days(
+        out.get("receivables_days_prev"),
+        out.get("inventory_days_prev"),
+        out.get("payables_days_prev"),
+    )
+    earlier_cycle = _cash_conversion_cycle_days(
+        to_float(earlier_days.get("receivables_days")),
+        to_float(earlier_days.get("inventory_days")),
+        to_float(earlier_days.get("payables_days")),
+    )
+    out["cash_conversion_cycle_days"] = current_cycle
+    out["cash_conversion_cycle_days_prev"] = previous_cycle
+    if current_cycle is not None and previous_cycle is not None:
+        current_delta = float(current_cycle - previous_cycle)
+        out["cash_conversion_cycle_days_delta"] = current_delta
+        if earlier_cycle is not None:
+            previous_delta = float(previous_cycle - earlier_cycle)
+            out["cash_conversion_cycle_convexity"] = float(current_delta - previous_delta)
+    return out
 
 
 def _safe_divide(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
@@ -763,6 +1159,7 @@ def compute_working_capital_stress_metrics(
         "working_capital_inventory_stress": None,
         "working_capital_payables_stress": None,
         "working_capital_cfo_stress": None,
+        "working_capital_cycle_stress": None,
     }
 
     matched = _matched_statement_sets(fundamentals, "yearly")
@@ -832,6 +1229,13 @@ def compute_capital_allocation_quality_metrics(
         "capital_allocation_funding_component": None,
         "capital_allocation_debt_component": None,
         "capital_allocation_payout_component": None,
+        "capital_allocation_reinvestment_component": None,
+        "capital_allocation_financing_dependency_component": None,
+        "financing_dependency_stress": None,
+        "financing_dependency_burn_component": None,
+        "financing_dependency_dilution_component": None,
+        "financing_dependency_debt_component": None,
+        "financing_dependency_revision_component": None,
     }
 
     matched = _matched_statement_sets(fundamentals, "yearly")
@@ -944,13 +1348,81 @@ def compute_recovery_fundamental_metrics(
 
 
 def _cash_like_assets(balance: Dict[str, Any]) -> Optional[float]:
-    return pick_first(
+    combined = pick_first(balance, "cashAndShortTermInvestments")
+    if combined is not None:
+        return float(combined)
+
+    cash = pick_first(
         balance,
         "cashAndCashEquivalents",
-        "cashAndShortTermInvestments",
         "cash",
         "cashAndEquivalents",
     )
+    short_term_investments = pick_first(balance, "shortTermInvestments")
+    if cash is not None and short_term_investments is not None:
+        return float(cash + short_term_investments)
+    if cash is not None:
+        return float(cash)
+    if short_term_investments is not None:
+        return float(short_term_investments)
+    return None
+
+
+def _ttm_cash_flow_snapshot(fundamentals: Dict[str, Any]) -> Dict[str, Any]:
+    quarterly = _matched_statement_sets(fundamentals, "quarterly")
+    if len(quarterly) >= 4:
+        latest = quarterly[0]
+        previous = quarterly[1] if len(quarterly) >= 2 else None
+        cfo_values = [
+            pick_first(entry["cashflow"], "totalCashFromOperatingActivities", "operatingCashFlow")
+            for entry in quarterly[:4]
+        ]
+        capex_values = [_capital_expenditure_abs(entry["cashflow"]) for entry in quarterly[:4]]
+        ttm_cfo = float(sum(float(value) for value in cfo_values)) if all(value is not None for value in cfo_values) else None
+        ttm_capex = float(sum(float(value or 0.0) for value in capex_values)) if capex_values else None
+        ttm_fcf = float(ttm_cfo - (ttm_capex or 0.0)) if ttm_cfo is not None else None
+        latest_cfo = cfo_values[0]
+        debt_latest = _total_debt(latest["balance"])
+        debt_previous = _total_debt(previous["balance"]) if previous is not None else None
+        debt_change = (
+            (float(debt_previous) - float(debt_latest)) / max(abs(float(debt_previous)), 1.0)
+            if debt_latest is not None and debt_previous not in (None, 0)
+            else None
+        )
+        return {
+            "ttm_fcf": ttm_fcf,
+            "latest_cfo": latest_cfo,
+            "latest_balance": latest["balance"],
+            "debt_change": debt_change,
+        }
+
+    yearly = _matched_statement_sets(fundamentals, "yearly")
+    if not yearly:
+        return {
+            "ttm_fcf": None,
+            "latest_cfo": None,
+            "latest_balance": None,
+            "debt_change": None,
+        }
+
+    latest = yearly[0]
+    previous = yearly[1] if len(yearly) >= 2 else None
+    latest_cfo = pick_first(latest["cashflow"], "totalCashFromOperatingActivities", "operatingCashFlow")
+    latest_capex = _capital_expenditure_abs(latest["cashflow"])
+    ttm_fcf = float(latest_cfo - (latest_capex or 0.0)) if latest_cfo is not None else None
+    debt_latest = _total_debt(latest["balance"])
+    debt_previous = _total_debt(previous["balance"]) if previous is not None else None
+    debt_change = (
+        (float(debt_previous) - float(debt_latest)) / max(abs(float(debt_previous)), 1.0)
+        if debt_latest is not None and debt_previous not in (None, 0)
+        else None
+    )
+    return {
+        "ttm_fcf": ttm_fcf,
+        "latest_cfo": latest_cfo,
+        "latest_balance": latest["balance"],
+        "debt_change": debt_change,
+    }
 
 
 def _effective_total_assets(
@@ -1283,95 +1755,114 @@ def _compute_working_capital_stress_metrics_v2(
         "working_capital_inventory_stress": None,
         "working_capital_payables_stress": None,
         "working_capital_cfo_stress": None,
+        "working_capital_cycle_stress": None,
     }
 
     matched = _matched_statement_sets(fundamentals, "quarterly")
-    if len(matched) < 4:
+    period_days = 90.0
+    if len(matched) < 2:
         matched = _matched_statement_sets(fundamentals, "yearly")
+        period_days = 365.0
     if len(matched) < 2:
         return out
 
-    window = min(4, len(matched))
-    transitions: List[Dict[str, float]] = []
-    for idx in range(window - 1):
-        current = matched[idx]
-        previous = matched[idx + 1]
-        inc0, inc1 = current["income"], previous["income"]
-        bal0, bal1 = current["balance"], previous["balance"]
-        cf0 = current["cashflow"]
-
-        sales_0 = pick_first(inc0, "totalRevenue")
-        sales_1 = pick_first(inc1, "totalRevenue")
-        receivables_0 = pick_first(bal0, "netReceivables", "accountsReceivable")
-        receivables_1 = pick_first(bal1, "netReceivables", "accountsReceivable")
-        inventory_0 = _inventory_value(bal0)
-        inventory_1 = _inventory_value(bal1)
-        payables_0 = _accounts_payable_value(bal0)
-        payables_1 = _accounts_payable_value(bal1)
-        net_income_0 = pick_first(inc0, "netIncome")
-        cfo_0 = pick_first(cf0, "totalCashFromOperatingActivities", "operatingCashFlow")
-
-        sales_growth = _safe_divide(
-            (sales_0 - sales_1) if sales_0 is not None and sales_1 is not None else None,
-            abs(float(sales_1)) if sales_1 not in (None, 0) else None,
+    window = list(reversed(matched[:5]))
+    rows: List[Dict[str, float]] = []
+    for idx, entry in enumerate(window):
+        previous = window[idx - 1] if idx > 0 else None
+        turnover_days = _turnover_days_from_entry(
+            entry["income"],
+            entry["balance"],
+            previous["balance"] if previous is not None else None,
+            period_days,
         )
-        receivables_growth = _safe_divide(
-            (receivables_0 - receivables_1) if receivables_0 is not None and receivables_1 is not None else None,
-            abs(float(receivables_1)) if receivables_1 not in (None, 0) else None,
+        cycle_days = _cash_conversion_cycle_days(
+            turnover_days["receivables_days"],
+            turnover_days["inventory_days"],
+            turnover_days["payables_days"],
         )
-        inventory_growth = _safe_divide(
-            (inventory_0 - inventory_1) if inventory_0 is not None and inventory_1 is not None else None,
-            abs(float(inventory_1)) if inventory_1 not in (None, 0) else None,
-        )
-        payables_growth = _safe_divide(
-            (payables_0 - payables_1) if payables_0 is not None and payables_1 is not None else None,
-            abs(float(payables_1)) if payables_1 not in (None, 0) else None,
-        )
+        net_income = pick_first(entry["income"], "netIncome")
+        cfo = pick_first(entry["cashflow"], "totalCashFromOperatingActivities", "operatingCashFlow")
         cfo_gap = _safe_divide(
-            (net_income_0 - cfo_0) if net_income_0 is not None and cfo_0 is not None else None,
-            max(abs(float(net_income_0)), 1.0) if net_income_0 is not None else None,
+            (net_income - cfo) if net_income is not None and cfo is not None else None,
+            max(abs(float(net_income)), 1.0) if net_income is not None else None,
         )
 
-        transitions.append(
-            {
-                "receivables_stress": max(0.0, float(receivables_growth - sales_growth)) if receivables_growth is not None and sales_growth is not None else np.nan,
-                "inventory_stress": max(0.0, float(inventory_growth - sales_growth)) if inventory_growth is not None and sales_growth is not None else np.nan,
-                "payables_stress": max(0.0, float(payables_growth - sales_growth - 0.08)) if payables_growth is not None and sales_growth is not None else np.nan,
-                "cfo_stress": max(0.0, float(cfo_gap)) if cfo_gap is not None else np.nan,
-            }
-        )
+        row = {
+            "receivables_days": float(turnover_days["receivables_days"]) if turnover_days["receivables_days"] is not None else np.nan,
+            "inventory_days": float(turnover_days["inventory_days"]) if turnover_days["inventory_days"] is not None else np.nan,
+            "payables_days": float(turnover_days["payables_days"]) if turnover_days["payables_days"] is not None else np.nan,
+            "cash_conversion_cycle_days": float(cycle_days) if cycle_days is not None else np.nan,
+            "cfo_stress": max(0.0, float(cfo_gap)) if cfo_gap is not None else np.nan,
+        }
+        if pd.isna(pd.Series(row)).all():
+            continue
+        rows.append(row)
 
-    if not transitions:
+    if len(rows) < 2:
         return out
 
-    frame = pd.DataFrame(transitions)
+    frame = pd.DataFrame(rows)
+    delta_frame = pd.DataFrame(
+        {
+            "receivables_stress": frame["receivables_days"].diff(),
+            "inventory_stress": frame["inventory_days"].diff(),
+            "payables_stress": frame["payables_days"].diff(),
+            "cash_conversion_cycle_delta": frame["cash_conversion_cycle_days"].diff(),
+        }
+    )
+
     penalties: List[float] = []
     averages: Dict[str, Optional[float]] = {}
     for column, scale in [
-        ("receivables_stress", 0.22),
-        ("inventory_stress", 0.22),
-        ("payables_stress", 0.25),
-        ("cfo_stress", 0.30),
+        ("receivables_stress", 18.0),
+        ("inventory_stress", 22.0),
+        ("payables_stress", 15.0),
     ]:
-        series = frame[column].dropna()
-        averages[column] = float(series.mean()) if not series.empty else None
+        series = pd.to_numeric(delta_frame[column], errors="coerce").dropna()
         if series.empty:
+            averages[column] = None
             continue
-        persistence = float((series > 0.02).mean())
-        composite = float(series.mean()) + 0.5 * persistence
+        positive_series = series.clip(lower=0.0)
+        averages[column] = float(positive_series.iloc[-1])
+        persistence = float((series > 0.0).mean())
+        composite = float(positive_series.mean()) * (0.70 + 0.30 * persistence)
         penalty = _clip_score(composite, scale)
         if penalty is not None:
             penalties.append(float(max(0.0, penalty)))
+
+    cfo_series = pd.to_numeric(frame["cfo_stress"], errors="coerce").dropna()
+    averages["cfo_stress"] = float(cfo_series.iloc[-1]) if not cfo_series.empty else None
+    if not cfo_series.empty:
+        cfo_persistence = float((cfo_series > 0.05).mean())
+        cfo_composite = float(cfo_series.mean()) * (0.75 + 0.25 * cfo_persistence)
+        cfo_penalty = _clip_score(cfo_composite, 0.25)
+        if cfo_penalty is not None:
+            penalties.append(float(max(0.0, cfo_penalty)))
+
+    ccc_delta_series = pd.to_numeric(delta_frame["cash_conversion_cycle_delta"], errors="coerce").dropna()
+    ccc_convexity_series = ccc_delta_series.diff().dropna()
+    latest_ccc_delta = float(ccc_delta_series.iloc[-1]) if not ccc_delta_series.empty else None
+    latest_ccc_convexity = float(ccc_convexity_series.iloc[-1]) if not ccc_convexity_series.empty else None
+    working_capital_cycle_stress = _mean_available(
+        [
+            _clip_score(max(0.0, latest_ccc_delta), 20.0) if latest_ccc_delta is not None else None,
+            _clip_score(max(0.0, latest_ccc_convexity), 12.0) if latest_ccc_convexity is not None else None,
+        ]
+    )
+    if working_capital_cycle_stress is not None:
+        penalties.append(float(max(0.0, working_capital_cycle_stress)))
 
     if len(penalties) < 2:
         return out
 
     out["working_capital_stress_penalty"] = float(min(0.06, max(0.0, 0.06 * sum(penalties) / len(penalties))))
-    out["working_capital_stress_has_coverage"] = float(min(1.0, len(penalties) / 4.0))
+    out["working_capital_stress_has_coverage"] = float(min(1.0, len(penalties) / 5.0))
     out["working_capital_receivables_stress"] = averages["receivables_stress"]
     out["working_capital_inventory_stress"] = averages["inventory_stress"]
     out["working_capital_payables_stress"] = averages["payables_stress"]
     out["working_capital_cfo_stress"] = averages["cfo_stress"]
+    out["working_capital_cycle_stress"] = working_capital_cycle_stress
     return out
 
 
@@ -1386,6 +1877,12 @@ def _compute_capital_allocation_quality_metrics_v2(
         "capital_allocation_debt_component": None,
         "capital_allocation_payout_component": None,
         "capital_allocation_reinvestment_component": None,
+        "capital_allocation_financing_dependency_component": None,
+        "financing_dependency_stress": None,
+        "financing_dependency_burn_component": None,
+        "financing_dependency_dilution_component": None,
+        "financing_dependency_debt_component": None,
+        "financing_dependency_revision_component": None,
     }
 
     matched = _matched_statement_sets(fundamentals, "yearly")
@@ -1394,13 +1891,23 @@ def _compute_capital_allocation_quality_metrics_v2(
 
     latest = matched[0]
     previous = matched[1]
-    share_latest = _share_count_from_record(latest["balance"])
-    share_previous = _share_count_from_record(previous["balance"])
-    share_change = (
-        (float(share_previous) - float(share_latest)) / max(abs(float(share_previous)), 1.0)
-        if share_latest is not None and share_previous not in (None, 0)
-        else None
+    share_drift_metrics = compute_share_drift_metrics_from_fundamentals(
+        fundamentals,
+        alpha_factor_spec="v2",
     )
+    share_drift_1q = to_float(share_drift_metrics.get("share_drift_1q"))
+    share_drift_4q = to_float(share_drift_metrics.get("share_drift_4q"))
+    share_drift_persistence = to_float(share_drift_metrics.get("share_drift_persistence"))
+
+    drift_components: List[tuple[float, float]] = []
+    if share_drift_4q is not None:
+        drift_components.append((0.70, float(share_drift_4q)))
+    if share_drift_1q is not None:
+        drift_components.append((0.30, float(share_drift_1q)))
+    share_change = None
+    if drift_components:
+        total_weight = float(sum(weight for weight, _ in drift_components))
+        share_change = float(sum(weight * value for weight, value in drift_components) / total_weight)
 
     debt_latest = _total_debt(latest["balance"])
     debt_previous = _total_debt(previous["balance"])
@@ -1423,8 +1930,24 @@ def _compute_capital_allocation_quality_metrics_v2(
     fcf_conversion = _free_cash_flow_conversion(net_income, cfo, capex_abs)
     capex_intensity = _safe_divide(capex_abs, total_assets)
     payout_ratio = pick_first(fundamentals.get("Highlights") or {}, "PayoutRatio")
+    financing_snapshot = _ttm_cash_flow_snapshot(fundamentals)
+    ttm_fcf = to_float(financing_snapshot.get("ttm_fcf"))
+    latest_cfo = to_float(financing_snapshot.get("latest_cfo"))
+    financing_balance = financing_snapshot.get("latest_balance")
+    financing_debt_change = to_float(financing_snapshot.get("debt_change"))
+    cash_like = _cash_like_assets(financing_balance) if isinstance(financing_balance, dict) else None
+    revision_metrics = compute_revision_impulse_metrics_from_fundamentals(
+        fundamentals,
+        min_revision_analysts=1,
+        alpha_factor_spec="v2",
+    )
+    revision_breadth_7d = to_float(revision_metrics.get("revision_breadth_7d"))
+    drift_30d = to_float(revision_metrics.get("revision_impulse_drift_30d"))
 
-    buyback_component = _clip_score(share_change, 0.08)
+    buyback_signal = share_change
+    if buyback_signal is not None and share_drift_persistence is not None:
+        buyback_signal = float(buyback_signal) * (0.70 + 0.30 * float(share_drift_persistence))
+    buyback_component = _clip_score(buyback_signal, 0.08)
     funding_component = None
     if share_change is not None and fcf is not None:
         funding_signal = float(fcf / max(abs(float(total_assets or 0.0)) * 0.04, 1.0)) + 0.60 * float(share_change)
@@ -1432,6 +1955,8 @@ def _compute_capital_allocation_quality_metrics_v2(
             funding_signal += 0.50 * float(debt_change)
         if fcf_conversion is not None:
             funding_signal += 0.30 * float(np.clip(fcf_conversion, -1.0, 1.0))
+        if share_drift_persistence is not None:
+            funding_signal += 0.20 * float(np.clip(share_drift_persistence - 0.50, -1.0, 1.0))
         funding_component = _clip_score(funding_signal, 1.0)
     debt_component = _clip_score(debt_change, 0.10)
     payout_component = None
@@ -1447,24 +1972,71 @@ def _compute_capital_allocation_quality_metrics_v2(
             reinvestment_signal = 0.55 * float(np.clip(revenue_growth / 0.20, -1.0, 1.0)) + 0.45 * reinvestment_signal
         reinvestment_component = float(np.clip(reinvestment_signal, -1.0, 1.0))
 
+    financing_burn_component = None
+    if ttm_fcf is not None:
+        burn_ratio = max(0.0, -float(ttm_fcf) / max(abs(float(cash_like or 0.0)), 1.0))
+        financing_burn_component = _clip_score(burn_ratio, 0.75)
+    financing_dilution_component = _clip_score(max(0.0, -float(share_change)), 0.08) if share_change is not None else None
+    financing_debt_component = (
+        _clip_score(max(0.0, -float(financing_debt_change)), 0.25)
+        if financing_debt_change is not None
+        else None
+    )
+    financing_revision_component = _mean_available(
+        [
+            _clip_score(max(0.0, -float(revision_breadth_7d)), 0.60) if revision_breadth_7d is not None else None,
+            _clip_score(max(0.0, -float(drift_30d)), 0.20) if drift_30d is not None else None,
+        ]
+    )
+
+    financing_dependency_stress = None
+    if ttm_fcf is not None and latest_cfo is not None and ttm_fcf >= 0 and latest_cfo >= 0:
+        financing_dependency_stress = 0.0
+    elif financing_burn_component is not None:
+        secondary_components = [
+            component
+            for component in [
+                financing_dilution_component,
+                financing_debt_component,
+                financing_revision_component,
+            ]
+            if component is not None
+        ]
+        if secondary_components:
+            financing_dependency_stress = _mean_available(
+                [financing_burn_component] + [float(component) for component in secondary_components]
+            )
+    financing_dependency_component = (
+        -float(financing_dependency_stress)
+        if financing_dependency_stress is not None
+        else None
+    )
+
     components = [
         buyback_component,
         funding_component,
         debt_component,
         payout_component,
         reinvestment_component,
+        financing_dependency_component,
     ]
     usable_components = [float(component) for component in components if component is not None]
     if len(usable_components) < 2:
         return out
 
     out["capital_allocation_quality_signal"] = float(sum(usable_components) / len(usable_components))
-    out["capital_allocation_quality_has_coverage"] = float(min(1.0, len(usable_components) / 5.0))
+    out["capital_allocation_quality_has_coverage"] = float(min(1.0, len(usable_components) / 6.0))
     out["capital_allocation_buyback_component"] = buyback_component
     out["capital_allocation_funding_component"] = funding_component
     out["capital_allocation_debt_component"] = debt_component
     out["capital_allocation_payout_component"] = payout_component
     out["capital_allocation_reinvestment_component"] = reinvestment_component
+    out["capital_allocation_financing_dependency_component"] = financing_dependency_component
+    out["financing_dependency_stress"] = financing_dependency_stress
+    out["financing_dependency_burn_component"] = financing_burn_component
+    out["financing_dependency_dilution_component"] = financing_dilution_component
+    out["financing_dependency_debt_component"] = financing_debt_component
+    out["financing_dependency_revision_component"] = financing_revision_component
     return out
 
 
@@ -1616,7 +2188,11 @@ def compute_investment_restraint_metrics(
 
 def compute_accrual_quality_metrics(
     fundamentals: Dict[str, Any],
+    alpha_factor_spec: str = "legacy",
 ) -> Dict[str, Optional[float]]:
+    if str(alpha_factor_spec).lower() == "v2":
+        return _compute_accrual_quality_metrics_v2(fundamentals)
+
     out: Dict[str, Optional[float]] = {
         "accrual_quality_signal": None,
         "accrual_quality_has_coverage": 0.0,
@@ -1628,6 +2204,7 @@ def compute_accrual_quality_metrics(
         "accrual_quality_cash_conversion": None,
         "accrual_quality_margin_gap": None,
         "accrual_quality_working_capital_stretch": None,
+        "accrual_quality_cycle_convexity": None,
     }
 
     matched = _matched_statement_sets(fundamentals, "quarterly")
@@ -1780,9 +2357,329 @@ def compute_accrual_quality_metrics(
     return out
 
 
-def compute_quality_acceleration_metrics_from_fundamentals(
+def _compute_accrual_quality_metrics_v2(
     fundamentals: Dict[str, Any],
 ) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {
+        "accrual_quality_signal": None,
+        "accrual_quality_has_coverage": 0.0,
+        "accrual_quality_measure_count": 0.0,
+        "accrual_quality_level_component": None,
+        "accrual_quality_stability_component": None,
+        "accrual_quality_trend_component": None,
+        "accrual_quality_periodicity": None,
+        "accrual_quality_cash_conversion": None,
+        "accrual_quality_margin_gap": None,
+        "accrual_quality_working_capital_stretch": None,
+        "accrual_quality_cycle_convexity": None,
+    }
+
+    matched = _matched_statement_sets(fundamentals, "quarterly")
+    periodicity = 1.0
+    period_days = 90.0
+    if len(matched) < 4:
+        matched = _matched_statement_sets(fundamentals, "yearly")
+        periodicity = 0.0
+        period_days = 365.0
+    if len(matched) < 4:
+        return out
+
+    matched = list(reversed(matched[:8]))
+    rows: List[Dict[str, float]] = []
+    for idx, entry in enumerate(matched):
+        previous = matched[idx - 1] if idx > 0 else None
+        income = entry["income"]
+        balance = entry["balance"]
+        cashflow = entry["cashflow"]
+
+        accrual_ratio = _accrual_ratio_from_set(entry, previous)
+        revenue = pick_first(income, "totalRevenue")
+        cfo = pick_first(cashflow, "totalCashFromOperatingActivities", "operatingCashFlow")
+        ebit = _ebit_value(income)
+        cash_conversion = _safe_divide(cfo, ebit) if ebit not in (None, 0) else None
+        cfo_margin = _safe_divide(cfo, revenue)
+        ebit_margin = _safe_divide(ebit, revenue)
+        margin_gap = float(cfo_margin - ebit_margin) if cfo_margin is not None and ebit_margin is not None else None
+        turnover_days = _turnover_days_from_entry(
+            income,
+            balance,
+            previous["balance"] if previous is not None else None,
+            period_days,
+        )
+        cycle_days = _cash_conversion_cycle_days(
+            turnover_days["receivables_days"],
+            turnover_days["inventory_days"],
+            turnover_days["payables_days"],
+        )
+
+        row = {
+            "accrual_ratio": float(accrual_ratio) if accrual_ratio is not None else np.nan,
+            "cash_conversion": float(cash_conversion) if cash_conversion is not None else np.nan,
+            "margin_gap": float(margin_gap) if margin_gap is not None else np.nan,
+            "receivables_days": float(turnover_days["receivables_days"]) if turnover_days["receivables_days"] is not None else np.nan,
+            "inventory_days": float(turnover_days["inventory_days"]) if turnover_days["inventory_days"] is not None else np.nan,
+            "cash_conversion_cycle_days": float(cycle_days) if cycle_days is not None else np.nan,
+        }
+        if pd.isna(pd.Series(row)).all():
+            continue
+        rows.append(row)
+
+    if len(rows) < 4:
+        return out
+
+    frame = pd.DataFrame(rows)
+    receivables_delta = frame["receivables_days"].diff()
+    inventory_delta = frame["inventory_days"].diff()
+    cash_conversion_cycle_delta = frame["cash_conversion_cycle_days"].diff()
+    cycle_convexity_series = cash_conversion_cycle_delta.diff()
+    stretch_frame = pd.DataFrame(
+        {
+            "receivables": receivables_delta.clip(lower=0.0),
+            "inventory": inventory_delta.clip(lower=0.0),
+            "cash_conversion_cycle": cash_conversion_cycle_delta.clip(lower=0.0),
+        }
+    )
+    frame["working_capital_stretch"] = stretch_frame.mean(axis=1, skipna=True)
+
+    latest_stretch = None
+    clean_stretch = frame["working_capital_stretch"].dropna()
+    if not clean_stretch.empty:
+        latest_stretch = float(clean_stretch.iloc[-1])
+    latest_cycle_convexity = None
+    clean_cycle_convexity = pd.to_numeric(cycle_convexity_series, errors="coerce").dropna()
+    if not clean_cycle_convexity.empty:
+        latest_cycle_convexity = float(clean_cycle_convexity.iloc[-1])
+
+    level_components = [
+        _clip_score(
+            None if frame["accrual_ratio"].dropna().empty else -float(frame["accrual_ratio"].dropna().iloc[-1]),
+            0.08,
+        ),
+        _series_latest(frame["cash_conversion"], 1.20),
+        _series_latest(frame["margin_gap"], 0.08),
+        _clip_score(-latest_stretch, 15.0) if latest_stretch is not None else None,
+    ]
+    stability_components = [
+        _series_inverse_std(frame["accrual_ratio"], 0.04),
+        _series_inverse_std(frame["cash_conversion"], 0.45),
+        _series_inverse_std(frame["margin_gap"], 0.05),
+        _series_inverse_std(frame["working_capital_stretch"], 8.0),
+    ]
+    working_capital_series = frame["working_capital_stretch"].dropna()
+    trend_components = [
+        _clip_score(
+            None
+            if frame["accrual_ratio"].dropna().shape[0] < 2
+            else float(frame["accrual_ratio"].dropna().iloc[0] - frame["accrual_ratio"].dropna().iloc[-1]),
+            0.05,
+        ),
+        _series_delta(frame["cash_conversion"], 0.50),
+        _series_delta(frame["margin_gap"], 0.05),
+        _clip_score(
+            None
+            if len(working_capital_series) < 2
+            else float(working_capital_series.iloc[0] - working_capital_series.iloc[-1]),
+            12.0,
+        ),
+        _clip_score(-latest_cycle_convexity, 12.0) if latest_cycle_convexity is not None else None,
+    ]
+
+    level_score = _mean_available(level_components)
+    stability_score = _mean_available(stability_components)
+    trend_score = _mean_available(trend_components)
+    family_coverage = {
+        "accruals": frame["accrual_ratio"].notna().sum() >= 2,
+        "cash_conversion": frame["cash_conversion"].notna().sum() >= 2,
+        "margins": frame["margin_gap"].notna().sum() >= 2,
+        "working_capital": frame["working_capital_stretch"].notna().sum() >= 2,
+    }
+    family_count = sum(bool(flag) for flag in family_coverage.values())
+    if family_count < 3:
+        return out
+
+    signal = _mean_available([level_score, stability_score, trend_score])
+    if signal is None:
+        return out
+
+    out["accrual_quality_signal"] = float(np.clip(signal * min(1.0, family_count / 4.0), -1.0, 1.0))
+    out["accrual_quality_has_coverage"] = float(min(1.0, family_count / 4.0))
+    out["accrual_quality_measure_count"] = float(len(frame))
+    out["accrual_quality_level_component"] = level_score
+    out["accrual_quality_stability_component"] = stability_score
+    out["accrual_quality_trend_component"] = trend_score
+    out["accrual_quality_periodicity"] = periodicity
+    out["accrual_quality_cash_conversion"] = (
+        None if frame["cash_conversion"].dropna().empty else float(frame["cash_conversion"].dropna().iloc[-1])
+    )
+    out["accrual_quality_margin_gap"] = (
+        None if frame["margin_gap"].dropna().empty else float(frame["margin_gap"].dropna().iloc[-1])
+    )
+    out["accrual_quality_working_capital_stretch"] = latest_stretch
+    out["accrual_quality_cycle_convexity"] = latest_cycle_convexity
+    return out
+
+
+def _compute_quality_acceleration_metrics_v2(
+    fundamentals: Dict[str, Any],
+) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {
+        "quality_acceleration_signal": None,
+        "quality_acceleration_has_coverage": 0.0,
+        "quality_acceleration_measure_count": 0.0,
+        "quality_acceleration_margin_delta": None,
+        "quality_acceleration_return_delta": None,
+        "quality_acceleration_turnover_delta": None,
+        "quality_acceleration_cfo_margin_delta": None,
+        "quality_acceleration_working_capital_delta": None,
+        "quality_acceleration_periodicity": None,
+    }
+
+    matched = _matched_statement_sets(fundamentals, "quarterly")
+    periodicity = 1.0
+    period_days = 90.0
+    if len(matched) < 3:
+        matched = _matched_statement_sets(fundamentals, "yearly")
+        periodicity = 0.0
+        period_days = 365.0
+    if len(matched) < 3:
+        return out
+
+    window = list(reversed(matched[:6]))
+    rows: List[Dict[str, float]] = []
+    for idx, entry in enumerate(window):
+        previous = window[idx - 1] if idx > 0 else None
+        income = entry["income"]
+        balance = entry["balance"]
+        cashflow = entry["cashflow"]
+        previous_balance = previous["balance"] if previous is not None else None
+
+        revenue = pick_first(income, "totalRevenue")
+        gross_margin = _gross_margin(income)
+
+        quality_return = None
+        ebit = _ebit_value(income)
+        invested_capital = _effective_invested_capital(balance, intangible_asset=0.0)
+        previous_invested_capital = (
+            _effective_invested_capital(previous_balance, intangible_asset=0.0)
+            if previous_balance is not None
+            else None
+        )
+        average_invested_capital = invested_capital
+        if (
+            invested_capital is not None
+            and previous_invested_capital is not None
+            and (invested_capital + previous_invested_capital) > 0
+        ):
+            average_invested_capital = (invested_capital + previous_invested_capital) / 2.0
+        if ebit is not None and average_invested_capital not in (None, 0):
+            quality_return = _safe_divide(ebit, average_invested_capital)
+
+        if quality_return is None:
+            net_income = pick_first(income, "netIncome")
+            assets = pick_first(balance, "totalAssets")
+            previous_assets = pick_first(previous_balance or {}, "totalAssets")
+            average_assets = assets
+            if assets is not None and previous_assets is not None and (assets + previous_assets) > 0:
+                average_assets = (assets + previous_assets) / 2.0
+            if net_income is not None and average_assets not in (None, 0):
+                quality_return = _safe_divide(net_income, average_assets)
+
+        asset_turnover = _asset_turnover(income, balance, previous_balance)
+        cfo = pick_first(cashflow, "totalCashFromOperatingActivities", "operatingCashFlow")
+        cfo_margin = _safe_divide(cfo, revenue)
+        turnover_days = _turnover_days_from_entry(
+            income,
+            balance,
+            previous_balance,
+            period_days,
+        )
+        cycle_days = _cash_conversion_cycle_days(
+            turnover_days["receivables_days"],
+            turnover_days["inventory_days"],
+            turnover_days["payables_days"],
+        )
+
+        row = {
+            "gross_margin": float(gross_margin) if gross_margin is not None else np.nan,
+            "quality_return": float(quality_return) if quality_return is not None else np.nan,
+            "asset_turnover": float(asset_turnover) if asset_turnover is not None else np.nan,
+            "cfo_margin": float(cfo_margin) if cfo_margin is not None else np.nan,
+            "receivables_days": float(turnover_days["receivables_days"]) if turnover_days["receivables_days"] is not None else np.nan,
+            "inventory_days": float(turnover_days["inventory_days"]) if turnover_days["inventory_days"] is not None else np.nan,
+            "cash_conversion_cycle_days": float(cycle_days) if cycle_days is not None else np.nan,
+        }
+        if pd.isna(pd.Series(row)).all():
+            continue
+        rows.append(row)
+
+    if len(rows) < 3:
+        return out
+
+    frame = pd.DataFrame(rows)
+
+    def _latest_vs_prior_mean(series: pd.Series) -> Optional[float]:
+        clean = pd.to_numeric(series, errors="coerce").dropna()
+        if len(clean) < 2:
+            return None
+        baseline = float(clean.iloc[-2]) if len(clean) == 2 else float(clean.iloc[:-1].mean())
+        return float(clean.iloc[-1] - baseline)
+
+    margin_delta = _latest_vs_prior_mean(frame["gross_margin"])
+    return_delta = _latest_vs_prior_mean(frame["quality_return"])
+    turnover_delta = _latest_vs_prior_mean(frame["asset_turnover"])
+    cfo_margin_delta = _latest_vs_prior_mean(frame["cfo_margin"])
+    receivables_days_delta = _latest_vs_prior_mean(frame["receivables_days"])
+    inventory_days_delta = _latest_vs_prior_mean(frame["inventory_days"])
+    cash_conversion_cycle_days_delta = _latest_vs_prior_mean(frame["cash_conversion_cycle_days"])
+    cash_conversion_cycle_convexity = _latest_vs_prior_mean(frame["cash_conversion_cycle_days"].diff())
+
+    working_capital_delta = None
+    wc_components = [
+        float(value)
+        for value in [
+            receivables_days_delta,
+            inventory_days_delta,
+            cash_conversion_cycle_days_delta,
+            cash_conversion_cycle_convexity,
+        ]
+        if value is not None
+    ]
+    if wc_components:
+        working_capital_delta = float(sum(wc_components) / len(wc_components))
+
+    weighted_components = [
+        (0.25, _clip_score(margin_delta, 0.04)),
+        (0.25, _clip_score(return_delta, 0.03)),
+        (0.20, _clip_score(turnover_delta, 0.10)),
+        (0.15, _clip_score(cfo_margin_delta, 0.04)),
+        (0.15, _clip_score(-working_capital_delta, 18.0) if working_capital_delta is not None else None),
+    ]
+    usable_components = [(weight, value) for weight, value in weighted_components if value is not None]
+    if len(usable_components) < 3:
+        return out
+
+    total_weight = float(sum(weight for weight, _ in usable_components))
+    signal = float(sum(weight * float(value) for weight, value in usable_components) / total_weight)
+
+    out["quality_acceleration_signal"] = float(np.clip(signal, -1.0, 1.0))
+    out["quality_acceleration_has_coverage"] = float(min(1.0, total_weight))
+    out["quality_acceleration_measure_count"] = float(len(frame))
+    out["quality_acceleration_margin_delta"] = margin_delta
+    out["quality_acceleration_return_delta"] = return_delta
+    out["quality_acceleration_turnover_delta"] = turnover_delta
+    out["quality_acceleration_cfo_margin_delta"] = cfo_margin_delta
+    out["quality_acceleration_working_capital_delta"] = working_capital_delta
+    out["quality_acceleration_periodicity"] = periodicity
+    return out
+
+
+def compute_quality_acceleration_metrics_from_fundamentals(
+    fundamentals: Dict[str, Any],
+    alpha_factor_spec: str = "legacy",
+) -> Dict[str, Optional[float]]:
+    if str(alpha_factor_spec).lower() == "v2":
+        return _compute_quality_acceleration_metrics_v2(fundamentals)
+
     out: Dict[str, Optional[float]] = {
         "quality_acceleration_signal": None,
         "quality_acceleration_has_coverage": 0.0,
@@ -1921,6 +2818,7 @@ def compute_quality_acceleration_metrics_from_fundamentals(
 def compute_revision_impulse_metrics_from_fundamentals(
     fundamentals: Dict[str, Any],
     min_revision_analysts: int,
+    alpha_factor_spec: str = "legacy",
 ) -> Dict[str, Optional[float]]:
     out: Dict[str, Optional[float]] = {
         "revision_impulse_signal": None,
@@ -1938,6 +2836,12 @@ def compute_revision_impulse_metrics_from_fundamentals(
         "revision_impulse_coverage_component": None,
         "revision_impulse_disagreement": None,
         "revision_impulse_disagreement_penalty": None,
+        "revision_short_divergence_component": None,
+        "revision_breadth_7d": None,
+        "revision_breadth_30d": None,
+        "revision_breadth_acceleration": None,
+        "float_absorption_signal": None,
+        "squeeze_convexity_signal": None,
     }
 
     trend = latest_earnings_trend_record(fundamentals)
@@ -1953,6 +2857,8 @@ def compute_revision_impulse_metrics_from_fundamentals(
     eps_7d = to_float(trend.get("epsTrend7daysAgo"))
     eps_30d = to_float(trend.get("epsTrend30daysAgo"))
     rev_up_7d = to_float(trend.get("epsRevisionsUpLast7days"))
+    rev_down_7d = to_float(trend.get("epsRevisionsDownLast7days"))
+    rev_up_30d = to_float(trend.get("epsRevisionsUpLast30days"))
     rev_down_30d = to_float(trend.get("epsRevisionsDownLast30days"))
 
     out["revision_impulse_analyst_count"] = analyst_count
@@ -1965,6 +2871,21 @@ def compute_revision_impulse_metrics_from_fundamentals(
     breadth = (
         _clip_unit((rev_up_7d - rev_down_30d) / max(float(analyst_count), 1.0))
         if rev_up_7d is not None and rev_down_30d is not None
+        else None
+    )
+    revision_breadth_7d = (
+        _clip_unit((rev_up_7d - rev_down_7d) / max(float(rev_up_7d + rev_down_7d), 1.0))
+        if rev_up_7d is not None and rev_down_7d is not None
+        else None
+    )
+    revision_breadth_30d = (
+        _clip_unit((rev_up_30d - rev_down_30d) / max(float(rev_up_30d + rev_down_30d), 1.0))
+        if rev_up_30d is not None and rev_down_30d is not None
+        else None
+    )
+    revision_breadth_acceleration = (
+        float(revision_breadth_7d - revision_breadth_30d)
+        if revision_breadth_7d is not None and revision_breadth_30d is not None
         else None
     )
     growth_component = _clip_unit(estimate_growth / 0.25) if estimate_growth is not None else None
@@ -1986,17 +2907,87 @@ def compute_revision_impulse_metrics_from_fundamentals(
         else 0.0
     )
     coverage_component = min(1.0, float(analyst_count) / max(1.0, float(min_revision_analysts)))
+    short_divergence_component = None
+    breadth_acceleration_component = None
+    float_absorption_signal = None
+    squeeze_convexity_signal = None
+    if str(alpha_factor_spec).lower() == "v2":
+        short_interest_metrics = compute_short_interest_metrics_from_fundamentals(fundamentals)
+        share_drift_metrics = compute_share_drift_metrics_from_fundamentals(
+            fundamentals,
+            alpha_factor_spec="v2",
+        )
+        institutional_breadth_metrics = compute_institutional_breadth_metrics_from_fundamentals(fundamentals)
+        short_components = [
+            _clip_score(-to_float(short_interest_metrics.get("short_interest_pct_float")), 0.15),
+            _clip_score(-to_float(short_interest_metrics.get("short_interest_ratio")), 8.0),
+            _clip_score(-to_float(short_interest_metrics.get("short_interest_change")), 0.25),
+        ]
+        usable_short_components = [float(component) for component in short_components if component is not None]
+        if len(usable_short_components) >= 2:
+            short_divergence_component = float(sum(usable_short_components) / len(usable_short_components))
+        breadth_acceleration_component = _clip_score(revision_breadth_acceleration, 0.75)
+
+        absorption_components: List[float] = []
+        has_short_input = False
+        has_absorption_input = False
+        short_pct_float_component = _clip_score(to_float(short_interest_metrics.get("short_interest_pct_float")), 0.18)
+        short_ratio_component = _clip_score(to_float(short_interest_metrics.get("short_interest_ratio")), 8.0)
+        share_drift_blended = to_float(share_drift_metrics.get("buyback_yield"))
+        share_drift_component = _clip_score(share_drift_blended, 0.05)
+        institutional_breadth_delta = to_float(institutional_breadth_metrics.get("institutional_breadth_delta"))
+        institutional_breadth_component = _clip_score(institutional_breadth_delta, 0.25)
+
+        for component in [short_pct_float_component, short_ratio_component]:
+            if component is not None:
+                absorption_components.append(float(component))
+                has_short_input = True
+        for component in [share_drift_component, institutional_breadth_component]:
+            if component is not None:
+                absorption_components.append(float(component))
+                has_absorption_input = True
+        if has_short_input and has_absorption_input and len(absorption_components) >= 3:
+            float_absorption_signal = float(sum(absorption_components) / len(absorption_components))
+
+        positive_revision_catalyst_components: List[float] = []
+        if drift_7d is not None:
+            positive_revision_catalyst_components.append(max(0.0, float(drift_7d)))
+        if revision_breadth_7d is not None:
+            positive_revision_catalyst_components.append(max(0.0, float(revision_breadth_7d)))
+        if breadth_acceleration_component is not None:
+            positive_revision_catalyst_components.append(max(0.0, float(breadth_acceleration_component)))
+        positive_revision_catalyst = (
+            float(sum(positive_revision_catalyst_components) / len(positive_revision_catalyst_components))
+            if len(positive_revision_catalyst_components) >= 2
+            else None
+        )
+        if float_absorption_signal is not None and positive_revision_catalyst is not None:
+            squeeze_convexity_signal = float(
+                np.clip(
+                    max(0.0, float(float_absorption_signal)) * max(0.0, float(positive_revision_catalyst)),
+                    0.0,
+                    1.0,
+                )
+            )
 
     base_components = [
         component
         for component in [drift_7d, drift_30d, breadth, growth_component]
         if component is not None
     ]
+    if str(alpha_factor_spec).lower() == "v2":
+        for component in [revision_breadth_7d, breadth_acceleration_component]:
+            if component is not None:
+                base_components.append(float(component))
+    if short_divergence_component is not None:
+        base_components.append(short_divergence_component)
     if len(base_components) < 2:
         return out
 
     base_signal = sum(float(component) for component in base_components) / float(len(base_components))
     signal = base_signal * coverage_component * (1.0 - disagreement_penalty)
+    if squeeze_convexity_signal is not None and str(alpha_factor_spec).lower() == "v2":
+        signal = 0.85 * float(signal) + 0.15 * float(squeeze_convexity_signal)
     signal = max(-1.0, min(1.0, float(signal)))
 
     out["revision_impulse_has_coverage"] = 1.0
@@ -2008,6 +2999,12 @@ def compute_revision_impulse_metrics_from_fundamentals(
     out["revision_impulse_coverage_component"] = float(coverage_component)
     out["revision_impulse_disagreement"] = disagreement
     out["revision_impulse_disagreement_penalty"] = float(disagreement_penalty)
+    out["revision_short_divergence_component"] = short_divergence_component
+    out["revision_breadth_7d"] = revision_breadth_7d
+    out["revision_breadth_30d"] = revision_breadth_30d
+    out["revision_breadth_acceleration"] = revision_breadth_acceleration
+    out["float_absorption_signal"] = float_absorption_signal
+    out["squeeze_convexity_signal"] = squeeze_convexity_signal
     out["revision_jerk_recent_velocity"] = recent_velocity
     out["revision_jerk_prior_velocity"] = prior_velocity
     out["revision_jerk_component"] = jerk_component

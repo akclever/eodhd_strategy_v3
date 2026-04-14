@@ -21,6 +21,7 @@ from eodhd_strategy.advanced_factors import (
     compute_revenue_growth_metrics_from_fundamentals,
     compute_revision_impulse_metrics_from_fundamentals,
     compute_sue_metrics_from_fundamentals,
+    compute_turnover_day_metrics_from_fundamentals,
     compute_working_capital_stress_metrics,
     passes_sentiment_coverage_gate,
 )
@@ -76,8 +77,11 @@ def _make_earnings_fundamentals() -> dict:
                     "earningsEstimateAvg": 1.00,
                     "earningsEstimateNumberOfAnalysts": 5,
                     "epsTrendCurrent": 1.10,
+                    "epsTrend7daysAgo": 1.02,
                     "epsTrend30daysAgo": 0.90,
                     "epsRevisionsUpLast7days": 3,
+                    "epsRevisionsDownLast7days": 1,
+                    "epsRevisionsUpLast30days": 4,
                     "epsRevisionsDownLast30days": 1,
                 }
             },
@@ -308,6 +312,223 @@ def test_revision_jerk_rewards_accelerating_estimate_change() -> None:
     assert fading_metrics["revision_jerk_signal"] is not None
     assert accelerating_metrics["revision_jerk_signal"] > fading_metrics["revision_jerk_signal"]
     assert accelerating_metrics["revision_jerk_has_coverage"] == 1.0
+
+
+def test_revision_impulse_v2_incorporates_short_interest_divergence_without_changing_legacy() -> None:
+    bullish = _make_earnings_fundamentals()
+    bullish["SharesStats"] = {
+        "SharesOutstanding": 100.0,
+        "SharesFloat": 80.0,
+        "ShortPercentFloat": 0.01,
+    }
+    bullish["Technicals"] = {
+        "SharesShort": 1.0,
+        "SharesShortPriorMonth": 2.0,
+        "ShortRatio": 1.0,
+        "ShortPercent": 0.01,
+    }
+    bullish["Earnings"]["Trend"]["2025-12-31"].update(
+        {
+            "earningsEstimateGrowth": 0.18,
+            "epsTrendCurrent": 1.16,
+            "epsTrend7daysAgo": 1.06,
+            "epsTrend30daysAgo": 0.95,
+            "epsRevisionsUpLast7days": 4,
+            "epsRevisionsDownLast30days": 0,
+        }
+    )
+
+    bearish = deepcopy(_make_earnings_fundamentals())
+    bearish["SharesStats"] = {
+        "SharesOutstanding": 100.0,
+        "SharesFloat": 80.0,
+        "ShortPercentFloat": 0.20,
+    }
+    bearish["Technicals"] = {
+        "SharesShort": 20.0,
+        "SharesShortPriorMonth": 12.0,
+        "ShortRatio": 10.0,
+        "ShortPercent": 0.20,
+    }
+    bearish["Earnings"]["Trend"]["2025-12-31"].update(
+        {
+            "earningsEstimateGrowth": -0.18,
+            "epsTrendCurrent": 0.82,
+            "epsTrend7daysAgo": 0.92,
+            "epsTrend30daysAgo": 1.05,
+            "epsRevisionsUpLast7days": 0,
+            "epsRevisionsDownLast30days": 4,
+        }
+    )
+
+    bullish_v2 = compute_revision_impulse_metrics_from_fundamentals(
+        bullish,
+        min_revision_analysts=4,
+        alpha_factor_spec="v2",
+    )
+    bearish_v2 = compute_revision_impulse_metrics_from_fundamentals(
+        bearish,
+        min_revision_analysts=4,
+        alpha_factor_spec="v2",
+    )
+    bullish_legacy = compute_revision_impulse_metrics_from_fundamentals(
+        bullish,
+        min_revision_analysts=4,
+        alpha_factor_spec="legacy",
+    )
+    bearish_legacy = compute_revision_impulse_metrics_from_fundamentals(
+        bearish,
+        min_revision_analysts=4,
+        alpha_factor_spec="legacy",
+    )
+
+    assert bullish_v2["revision_short_divergence_component"] is not None
+    assert bearish_v2["revision_short_divergence_component"] is not None
+    assert bullish_v2["revision_short_divergence_component"] > 0
+    assert bearish_v2["revision_short_divergence_component"] < 0
+    assert bullish_v2["revision_impulse_signal"] is not None
+    assert bearish_v2["revision_impulse_signal"] is not None
+    assert bullish_v2["revision_impulse_signal"] > bearish_v2["revision_impulse_signal"]
+    assert bullish_legacy["revision_short_divergence_component"] is None
+    assert bearish_legacy["revision_short_divergence_component"] is None
+    assert bullish_legacy["revision_impulse_signal"] is not None
+    assert bearish_legacy["revision_impulse_signal"] is not None
+    assert bullish_legacy["revision_impulse_signal"] > bearish_legacy["revision_impulse_signal"]
+
+
+def test_revision_impulse_v2_uses_breadth_acceleration_without_changing_legacy() -> None:
+    positive = _make_earnings_fundamentals()
+    negative = deepcopy(_make_earnings_fundamentals())
+
+    positive_trend = positive["Earnings"]["Trend"]["2025-12-31"]
+    negative_trend = negative["Earnings"]["Trend"]["2025-12-31"]
+    for trend in [positive_trend, negative_trend]:
+        trend.update(
+            {
+                "earningsEstimateGrowth": 0.12,
+                "epsTrendCurrent": 1.12,
+                "epsTrend7daysAgo": 1.06,
+                "epsTrend30daysAgo": 0.98,
+                "epsRevisionsUpLast7days": 2,
+                "epsRevisionsDownLast30days": 1,
+            }
+        )
+
+    positive_trend.update(
+        {
+            "epsRevisionsDownLast7days": 0,
+            "epsRevisionsUpLast30days": 1,
+        }
+    )
+    negative_trend.update(
+        {
+            "epsRevisionsDownLast7days": 2,
+            "epsRevisionsUpLast30days": 5,
+        }
+    )
+
+    positive_v2 = compute_revision_impulse_metrics_from_fundamentals(
+        positive,
+        min_revision_analysts=4,
+        alpha_factor_spec="v2",
+    )
+    negative_v2 = compute_revision_impulse_metrics_from_fundamentals(
+        negative,
+        min_revision_analysts=4,
+        alpha_factor_spec="v2",
+    )
+    positive_legacy = compute_revision_impulse_metrics_from_fundamentals(
+        positive,
+        min_revision_analysts=4,
+        alpha_factor_spec="legacy",
+    )
+    negative_legacy = compute_revision_impulse_metrics_from_fundamentals(
+        negative,
+        min_revision_analysts=4,
+        alpha_factor_spec="legacy",
+    )
+
+    assert positive_v2["revision_breadth_7d"] is not None
+    assert negative_v2["revision_breadth_7d"] is not None
+    assert positive_v2["revision_breadth_acceleration"] is not None
+    assert negative_v2["revision_breadth_acceleration"] is not None
+    assert positive_v2["revision_breadth_acceleration"] > 0
+    assert negative_v2["revision_breadth_acceleration"] < 0
+    assert positive_v2["revision_impulse_signal"] is not None
+    assert negative_v2["revision_impulse_signal"] is not None
+    assert positive_v2["revision_impulse_signal"] > negative_v2["revision_impulse_signal"]
+    assert positive_legacy["revision_impulse_signal"] == negative_legacy["revision_impulse_signal"]
+
+
+def test_revision_impulse_v2_builds_squeeze_convexity_only_with_positive_revision_catalyst() -> None:
+    bullish = _make_statement_fundamentals()
+    bullish.update(_make_earnings_fundamentals())
+    bullish["SharesStats"] = {
+        "SharesOutstanding": 95.0,
+        "SharesFloat": 75.0,
+        "ShortPercentFloat": 0.22,
+    }
+    bullish["Technicals"] = {
+        "ShortRatio": 9.0,
+        "SharesShort": 16.5,
+        "SharesShortPriorMonth": 14.0,
+    }
+    bullish["Holders"] = {
+        "Institutions": {
+            "2025-12-31_a": {"date": "2025-12-31", "totalShares": 18.0},
+            "2025-12-31_b": {"date": "2025-12-31", "totalShares": 17.0},
+            "2025-12-31_c": {"date": "2025-12-31", "totalShares": 15.0},
+            "2025-09-30_a": {"date": "2025-09-30", "totalShares": 9.0},
+        }
+    }
+    bullish["Earnings"]["Trend"]["2025-12-31"].update(
+        {
+            "earningsEstimateGrowth": 0.16,
+            "epsTrendCurrent": 1.18,
+            "epsTrend7daysAgo": 1.08,
+            "epsTrend30daysAgo": 0.98,
+            "epsRevisionsUpLast7days": 4,
+            "epsRevisionsDownLast7days": 0,
+            "epsRevisionsUpLast30days": 5,
+            "epsRevisionsDownLast30days": 1,
+        }
+    )
+
+    no_catalyst = deepcopy(bullish)
+    no_catalyst["Earnings"]["Trend"]["2025-12-31"].update(
+        {
+            "earningsEstimateGrowth": -0.02,
+            "epsTrendCurrent": 0.98,
+            "epsTrend7daysAgo": 1.08,
+            "epsTrend30daysAgo": 1.00,
+            "epsRevisionsUpLast7days": 0,
+            "epsRevisionsDownLast7days": 3,
+            "epsRevisionsUpLast30days": 1,
+            "epsRevisionsDownLast30days": 4,
+        }
+    )
+
+    bullish_metrics = compute_revision_impulse_metrics_from_fundamentals(
+        bullish,
+        min_revision_analysts=4,
+        alpha_factor_spec="v2",
+    )
+    no_catalyst_metrics = compute_revision_impulse_metrics_from_fundamentals(
+        no_catalyst,
+        min_revision_analysts=4,
+        alpha_factor_spec="v2",
+    )
+
+    assert bullish_metrics["float_absorption_signal"] is not None
+    assert no_catalyst_metrics["float_absorption_signal"] is not None
+    assert bullish_metrics["float_absorption_signal"] > 0
+    assert no_catalyst_metrics["float_absorption_signal"] > 0
+    assert bullish_metrics["squeeze_convexity_signal"] is not None
+    assert no_catalyst_metrics["squeeze_convexity_signal"] == 0.0
+    assert bullish_metrics["squeeze_convexity_signal"] > 0
+    assert bullish_metrics["revision_impulse_signal"] is not None
+    assert no_catalyst_metrics["revision_impulse_signal"] is not None
+    assert bullish_metrics["revision_impulse_signal"] > no_catalyst_metrics["revision_impulse_signal"]
 
 
 def test_estimate_term_structure_rewards_persistent_positive_revisions() -> None:
@@ -627,6 +848,93 @@ def test_quality_acceleration_rewards_improving_business_quality() -> None:
     assert improving_metrics["quality_acceleration_measure_count"] >= 3
 
 
+def test_v2_turnover_day_signals_penalize_working_capital_deterioration_and_reward_improvement() -> None:
+    improving = _make_statement_fundamentals()
+    deteriorating = deepcopy(_make_statement_fundamentals())
+
+    improving_quarterly = improving["Financials"]["Balance_Sheet"]["quarterly"]
+    deteriorating_quarterly = deteriorating["Financials"]["Balance_Sheet"]["quarterly"]
+    for date, receivables, inventory, payables in [
+        ("2025-12-31", 52.0, 32.0, 70.0),
+        ("2025-09-30", 55.0, 34.0, 69.0),
+        ("2025-06-30", 58.0, 36.0, 68.0),
+        ("2025-03-31", 60.0, 38.0, 67.0),
+        ("2024-12-31", 62.0, 40.0, 66.0),
+    ]:
+        improving_quarterly[date].update(
+            {
+                "netReceivables": receivables,
+                "inventory": inventory,
+                "accountsPayable": payables,
+            }
+        )
+    for date, receivables, inventory, payables in [
+        ("2025-12-31", 105.0, 90.0, 95.0),
+        ("2025-09-30", 80.0, 65.0, 78.0),
+        ("2025-06-30", 65.0, 55.0, 70.0),
+        ("2025-03-31", 60.0, 50.0, 65.0),
+        ("2024-12-31", 58.0, 48.0, 60.0),
+    ]:
+        deteriorating_quarterly[date].update(
+            {
+                "netReceivables": receivables,
+                "inventory": inventory,
+                "accountsPayable": payables,
+            }
+        )
+    deteriorating["Financials"]["Cash_Flow"]["quarterly"]["2025-12-31"]["totalCashFromOperatingActivities"] = 12.0
+    deteriorating["Financials"]["Cash_Flow"]["quarterly"]["2025-09-30"]["totalCashFromOperatingActivities"] = 14.0
+    deteriorating["Financials"]["Cash_Flow"]["quarterly"]["2025-06-30"]["totalCashFromOperatingActivities"] = 16.0
+    deteriorating["Financials"]["Cash_Flow"]["quarterly"]["2025-03-31"]["totalCashFromOperatingActivities"] = 18.0
+
+    improving_stress = compute_working_capital_stress_metrics(
+        improving,
+        alpha_factor_spec="v2",
+    )
+    deteriorating_stress = compute_working_capital_stress_metrics(
+        deteriorating,
+        alpha_factor_spec="v2",
+    )
+    improving_accrual = compute_accrual_quality_metrics(
+        improving,
+        alpha_factor_spec="v2",
+    )
+    deteriorating_accrual = compute_accrual_quality_metrics(
+        deteriorating,
+        alpha_factor_spec="v2",
+    )
+    improving_acceleration = compute_quality_acceleration_metrics_from_fundamentals(
+        improving,
+        alpha_factor_spec="v2",
+    )
+    deteriorating_acceleration = compute_quality_acceleration_metrics_from_fundamentals(
+        deteriorating,
+        alpha_factor_spec="v2",
+    )
+    deteriorating_turnover = compute_turnover_day_metrics_from_fundamentals(deteriorating)
+
+    assert improving_stress["working_capital_stress_penalty"] is not None
+    assert deteriorating_stress["working_capital_stress_penalty"] is not None
+    assert deteriorating_stress["working_capital_stress_penalty"] > improving_stress["working_capital_stress_penalty"]
+    assert deteriorating_stress["working_capital_receivables_stress"] is not None
+    assert deteriorating_stress["working_capital_inventory_stress"] is not None
+    assert deteriorating_turnover["cash_conversion_cycle_days"] is not None
+    assert deteriorating_turnover["cash_conversion_cycle_days_delta"] is not None
+    assert deteriorating_turnover["cash_conversion_cycle_convexity"] is not None
+    assert deteriorating_stress["working_capital_cycle_stress"] is not None
+    assert improving_stress["working_capital_cycle_stress"] is not None
+    assert deteriorating_stress["working_capital_cycle_stress"] > improving_stress["working_capital_cycle_stress"]
+    assert improving_accrual["accrual_quality_signal"] is not None
+    assert deteriorating_accrual["accrual_quality_signal"] is not None
+    assert improving_accrual["accrual_quality_signal"] > deteriorating_accrual["accrual_quality_signal"]
+    assert improving_accrual["accrual_quality_cycle_convexity"] is not None
+    assert deteriorating_accrual["accrual_quality_cycle_convexity"] is not None
+    assert improving_accrual["accrual_quality_cycle_convexity"] < deteriorating_accrual["accrual_quality_cycle_convexity"]
+    assert improving_acceleration["quality_acceleration_signal"] is not None
+    assert deteriorating_acceleration["quality_acceleration_signal"] is not None
+    assert improving_acceleration["quality_acceleration_signal"] > deteriorating_acceleration["quality_acceleration_signal"]
+
+
 def test_capital_allocation_quality_rewards_fcf_funded_buybacks_and_deleveraging() -> None:
     metrics = compute_capital_allocation_quality_metrics(_make_statement_fundamentals())
 
@@ -655,6 +963,117 @@ def test_capital_allocation_quality_v2_penalizes_debt_funded_buybacks() -> None:
     assert good_metrics["capital_allocation_quality_signal"] is not None
     assert bad_metrics["capital_allocation_quality_signal"] is not None
     assert bad_metrics["capital_allocation_quality_signal"] < good_metrics["capital_allocation_quality_signal"]
+
+
+def test_capital_allocation_quality_v2_penalizes_reversal_heavy_buybacks() -> None:
+    good_metrics = compute_capital_allocation_quality_metrics(
+        _make_statement_fundamentals(),
+        alpha_factor_spec="v2",
+    )
+
+    reversal_heavy = deepcopy(_make_statement_fundamentals())
+    reversal_heavy["Financials"]["Balance_Sheet"]["quarterly"]["2025-12-31"]["commonStockSharesOutstanding"] = 101.0
+    reversal_heavy["Financials"]["Balance_Sheet"]["quarterly"]["2025-09-30"]["commonStockSharesOutstanding"] = 98.0
+    reversal_heavy["Financials"]["Balance_Sheet"]["quarterly"]["2025-06-30"]["commonStockSharesOutstanding"] = 96.0
+    reversal_heavy["Financials"]["Balance_Sheet"]["quarterly"]["2025-03-31"]["commonStockSharesOutstanding"] = 94.0
+    reversal_heavy["Financials"]["Balance_Sheet"]["quarterly"]["2024-12-31"]["commonStockSharesOutstanding"] = 100.0
+    reversal_heavy["Financials"]["Balance_Sheet"]["yearly"]["2025-12-31"]["longTermDebt"] = 340.0
+    reversal_heavy["Financials"]["Cash_Flow"]["yearly"]["2025-12-31"]["totalCashFromOperatingActivities"] = 10.0
+    reversal_heavy["Financials"]["Cash_Flow"]["yearly"]["2025-12-31"]["capitalExpenditures"] = -40.0
+
+    reversal_metrics = compute_capital_allocation_quality_metrics(
+        reversal_heavy,
+        alpha_factor_spec="v2",
+    )
+
+    assert good_metrics["capital_allocation_quality_signal"] is not None
+    assert reversal_metrics["capital_allocation_quality_signal"] is not None
+    assert good_metrics["capital_allocation_buyback_component"] is not None
+    assert reversal_metrics["capital_allocation_buyback_component"] is not None
+    assert good_metrics["capital_allocation_buyback_component"] > reversal_metrics["capital_allocation_buyback_component"]
+    assert good_metrics["capital_allocation_quality_signal"] > reversal_metrics["capital_allocation_quality_signal"]
+
+
+def test_capital_allocation_quality_v2_penalizes_financing_dependency_stress() -> None:
+    healthy = _make_statement_fundamentals()
+    healthy_metrics = compute_capital_allocation_quality_metrics(
+        healthy,
+        alpha_factor_spec="v2",
+    )
+
+    stressed = deepcopy(_make_statement_fundamentals())
+    stressed["Financials"]["Balance_Sheet"]["yearly"]["2025-12-31"].update(
+        {
+            "cash": 8.0,
+            "shortTermInvestments": 2.0,
+            "longTermDebt": 260.0,
+            "commonStockSharesOutstanding": 110.0,
+        }
+    )
+    stressed["Financials"]["Balance_Sheet"]["yearly"]["2024-12-31"].update(
+        {
+            "cash": 18.0,
+            "shortTermInvestments": 4.0,
+            "longTermDebt": 220.0,
+            "commonStockSharesOutstanding": 100.0,
+        }
+    )
+    for date, debt, shares in [
+        ("2025-12-31", 280.0, 110.0),
+        ("2025-09-30", 270.0, 107.0),
+        ("2025-06-30", 260.0, 104.0),
+        ("2025-03-31", 250.0, 102.0),
+    ]:
+        stressed["Financials"]["Balance_Sheet"]["quarterly"][date].update(
+            {
+                "cash": 8.0,
+                "shortTermInvestments": 2.0,
+                "longTermDebt": debt,
+                "commonStockSharesOutstanding": shares,
+            }
+        )
+    for date, cfo, capex in [
+        ("2025-12-31", -6.0, -6.0),
+        ("2025-09-30", -5.0, -6.0),
+        ("2025-06-30", -4.0, -6.0),
+        ("2025-03-31", -3.0, -6.0),
+    ]:
+        stressed["Financials"]["Cash_Flow"]["quarterly"][date].update(
+            {
+                "totalCashFromOperatingActivities": cfo,
+                "capitalExpenditures": capex,
+            }
+        )
+    stressed["Earnings"] = {
+        "Trend": {
+            "2025-12-31": {
+                "date": "2025-12-31",
+                "earningsEstimateAvg": 1.0,
+                "earningsEstimateNumberOfAnalysts": 4,
+                "epsTrendCurrent": 0.82,
+                "epsTrend7daysAgo": 0.90,
+                "epsTrend30daysAgo": 1.00,
+                "epsRevisionsUpLast7days": 0,
+                "epsRevisionsDownLast7days": 2,
+                "epsRevisionsUpLast30days": 1,
+                "epsRevisionsDownLast30days": 4,
+            }
+        }
+    }
+
+    stressed_metrics = compute_capital_allocation_quality_metrics(
+        stressed,
+        alpha_factor_spec="v2",
+    )
+
+    assert healthy_metrics["financing_dependency_stress"] == 0.0
+    assert stressed_metrics["financing_dependency_stress"] is not None
+    assert stressed_metrics["financing_dependency_stress"] > 0
+    assert stressed_metrics["capital_allocation_financing_dependency_component"] is not None
+    assert stressed_metrics["capital_allocation_financing_dependency_component"] < 0
+    assert healthy_metrics["capital_allocation_quality_signal"] is not None
+    assert stressed_metrics["capital_allocation_quality_signal"] is not None
+    assert stressed_metrics["capital_allocation_quality_signal"] < healthy_metrics["capital_allocation_quality_signal"]
 
 
 def test_recovery_fundamentals_capture_margin_and_leverage_improvement() -> None:

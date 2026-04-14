@@ -877,6 +877,65 @@ def test_build_ranked_frame_handles_revision_columns_when_overlay_disabled() -> 
     assert ranked["symbol"].tolist() == ["BASEPASS"]
 
 
+def test_build_ranked_frame_v2_keeps_new_columns_with_null_safe_defaults() -> None:
+    df = pd.DataFrame([_base_row("BASEPASS")])
+
+    all_rows, ranked, _ = build_ranked_frame(
+        df,
+        _config(
+            alpha_factor_spec="v2",
+            use_pead=False,
+            use_sentiment=False,
+            use_revision_impulse=True,
+            use_peer_relative_anomalies=True,
+            use_working_capital_stress=True,
+            use_capital_allocation_quality=True,
+        ),
+    )
+
+    assert ranked["symbol"].tolist() == ["BASEPASS"]
+    for column in [
+        "revision_short_divergence_component",
+        "revision_breadth_7d",
+        "revision_breadth_30d",
+        "revision_breadth_acceleration",
+        "float_absorption_signal",
+        "squeeze_convexity_signal",
+        "short_interest_ratio",
+        "short_interest_pct_float",
+        "short_interest_change",
+        "institutional_breadth_delta",
+        "institutional_ownership_delta",
+        "institutional_top5_concentration_delta",
+        "share_drift_1q",
+        "share_drift_4q",
+        "share_drift_persistence",
+        "receivables_days",
+        "receivables_days_delta",
+        "inventory_days",
+        "inventory_days_delta",
+        "payables_days",
+        "payables_days_delta",
+        "cash_conversion_cycle_days",
+        "cash_conversion_cycle_days_delta",
+        "cash_conversion_cycle_convexity",
+        "peer_ownership_breadth_input",
+        "peer_relative_ownership_component",
+        "working_capital_cycle_stress",
+        "accrual_quality_cycle_convexity",
+        "capital_allocation_financing_dependency_component",
+        "financing_dependency_stress",
+        "financing_dependency_burn_component",
+        "financing_dependency_dilution_component",
+        "financing_dependency_debt_component",
+        "financing_dependency_revision_component",
+        "insider_ownership_confirmation_component",
+        "insider_short_crowding_penalty",
+    ]:
+        assert column in all_rows.columns
+        assert pd.isna(all_rows.loc[0, column])
+
+
 def test_life_cycle_assigns_expected_stages_and_conditioned_weights() -> None:
     df = pd.DataFrame(
         [
