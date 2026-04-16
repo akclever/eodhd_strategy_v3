@@ -2918,10 +2918,13 @@ def compute_revision_impulse_metrics_from_fundamentals(
             alpha_factor_spec="v2",
         )
         institutional_breadth_metrics = compute_institutional_breadth_metrics_from_fundamentals(fundamentals)
+        _si_pct = to_float(short_interest_metrics.get("short_interest_pct_float"))
+        _si_ratio = to_float(short_interest_metrics.get("short_interest_ratio"))
+        _si_change = to_float(short_interest_metrics.get("short_interest_change"))
         short_components = [
-            _clip_score(-to_float(short_interest_metrics.get("short_interest_pct_float")), 0.15),
-            _clip_score(-to_float(short_interest_metrics.get("short_interest_ratio")), 8.0),
-            _clip_score(-to_float(short_interest_metrics.get("short_interest_change")), 0.25),
+            _clip_score(-_si_pct, 0.15) if _si_pct is not None else None,
+            _clip_score(-_si_ratio, 8.0) if _si_ratio is not None else None,
+            _clip_score(-_si_change, 0.25) if _si_change is not None else None,
         ]
         usable_short_components = [float(component) for component in short_components if component is not None]
         if len(usable_short_components) >= 2:

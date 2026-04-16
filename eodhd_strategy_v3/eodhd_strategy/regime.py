@@ -6,6 +6,9 @@ from typing import Any, Dict, List
 import pandas as pd
 
 from .client import EODHDClient
+from .data_provider import DataProvider
+
+ClientLike = EODHDClient | DataProvider
 
 HIGH_IMPACT_KEYWORDS = ['cpi', 'pmi', 'payroll', 'fomc', 'fed', 'inflation', 'rate decision', 'interest rate', 'nfp']
 
@@ -37,7 +40,7 @@ def is_high_impact_event(event: Dict[str, Any]) -> bool:
     return any(k in _event_label(event).lower() for k in HIGH_IMPACT_KEYWORDS)
 
 
-def recommend_rebalance_date(client: EODHDClient, start_date: str, country: str = 'US', defer_if_within_days: int = 1, max_delay_days: int = 5) -> RebalanceWindowDecision:
+def recommend_rebalance_date(client: ClientLike, start_date: str, country: str = 'US', defer_if_within_days: int = 1, max_delay_days: int = 5) -> RebalanceWindowDecision:
     start = pd.Timestamp(start_date).normalize()
     end = start + pd.Timedelta(days=max_delay_days + defer_if_within_days)
     rows = _coerce_rows(client.get_economic_events(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'), country=country))

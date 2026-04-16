@@ -618,16 +618,16 @@ def test_insider_conviction_v2_uses_ownership_confirmation_and_short_crowding_pe
                 {
                     "date": (today - pd.Timedelta(days=7)).isoformat(),
                     "transactionCode": "P",
-                    "transactionAmount": 10000,
-                    "transactionPrice": 10.0,
+                    "transactionAmount": 50,
+                    "transactionPrice": 1.0,
                     "ownerName": "Jane Doe",
                     "officerTitle": "Chief Executive Officer",
                 },
                 {
                     "date": (today - pd.Timedelta(days=14)).isoformat(),
                     "transactionCode": "P",
-                    "transactionAmount": 5000,
-                    "transactionPrice": 10.0,
+                    "transactionAmount": 30,
+                    "transactionPrice": 1.0,
                     "ownerName": "John Doe",
                     "officerTitle": "Chief Financial Officer",
                 },
@@ -637,7 +637,7 @@ def test_insider_conviction_v2_uses_ownership_confirmation_and_short_crowding_pe
         FakeClient(),
         "ACME.US",
         alpha_factor_spec="v2",
-        revision_support=0.4,
+        revision_support=0.0,
         ownership_support=None,
         short_interest_change=0.0,
     )
@@ -645,7 +645,7 @@ def test_insider_conviction_v2_uses_ownership_confirmation_and_short_crowding_pe
         FakeClient(),
         "ACME.US",
         alpha_factor_spec="v2",
-        revision_support=0.4,
+        revision_support=0.0,
         ownership_support=0.8,
         short_interest_change=0.0,
     )
@@ -653,7 +653,7 @@ def test_insider_conviction_v2_uses_ownership_confirmation_and_short_crowding_pe
         FakeClient(),
         "ACME.US",
         alpha_factor_spec="v2",
-        revision_support=0.4,
+        revision_support=0.0,
         ownership_support=0.8,
         short_interest_change=0.5,
     )
@@ -661,7 +661,7 @@ def test_insider_conviction_v2_uses_ownership_confirmation_and_short_crowding_pe
         FakeClient(),
         "ACME.US",
         alpha_factor_spec="legacy",
-        revision_support=0.4,
+        revision_support=0.0,
         ownership_support=0.8,
         short_interest_change=0.5,
     )

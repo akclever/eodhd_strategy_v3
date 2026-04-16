@@ -6,7 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from .client import EODHDClient
+from .data_provider import DataProvider
 from .utils import to_float, utc_today_ts
+
+ClientLike = EODHDClient | DataProvider
 
 CYCLICAL_SECTORS = {
     "Energy",
@@ -118,7 +121,7 @@ def _event_label(event: Dict[str, Any]) -> str:
     return " ".join(x for x in parts if x).strip().lower()
 
 
-def _recent_event_surprise_score(client: EODHDClient, country: str, as_of_date: pd.Timestamp) -> float:
+def _recent_event_surprise_score(client: ClientLike, country: str, as_of_date: pd.Timestamp) -> float:
     start_date = (as_of_date - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
     end_date = as_of_date.strftime("%Y-%m-%d")
 
@@ -152,7 +155,7 @@ def _recent_event_surprise_score(client: EODHDClient, country: str, as_of_date: 
 
 
 def infer_macro_decision(
-    client: EODHDClient,
+    client: ClientLike,
     country: str = "USA",
     as_of_date: str | None = None,
     tilt_strength: float = 0.10,

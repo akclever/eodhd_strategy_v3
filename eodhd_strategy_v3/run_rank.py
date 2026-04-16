@@ -13,8 +13,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import pandas as pd
 
+from eodhd_strategy.alpha_vantage_client import AlphaVantageClient
 from eodhd_strategy.client import EODHDClient
 from eodhd_strategy.config import RankerConfig
+from eodhd_strategy.data_provider import DataProvider
+from eodhd_strategy.sec_edgar_client import SECEdgarClient
 from eodhd_strategy.exchanges import (
     extract_listing_symbols,
     infer_listing_region,
@@ -77,6 +80,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Modular EODHD ranker with staged overlays, macro tilts, and regional presets"
     )
     parser.add_argument("--api-token", default=None)
+    parser.add_argument(
+        "--data-provider",
+        choices=["eodhd", "alpha_vantage", "hybrid"],
+        default="eodhd",
+        help="Data provider mode: eodhd (default), alpha_vantage, or hybrid (AV primary with EODHD fallback)",
+    )
+    parser.add_argument("--alpha-vantage-api-key", default=None, help="Alpha Vantage API key (or set ALPHA_VANTAGE_API_KEY env var)")
+    parser.add_argument("--sec-edgar-email", default=None, help="Email for SEC EDGAR User-Agent (or set SEC_EDGAR_EMAIL env var)")
 
     parser.add_argument("--region", choices=["US", "HK", "AU", "DE", "FR", "NL", "CH"], default="US")
     parser.add_argument("--strict-issuer-country", action="store_true")
@@ -437,6 +448,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Minimum trailing revenue required for biotechnology names to avoid the binary-biotech exclusion",
     )
 
+    parser.add_argument(
+        "--use-technical-momentum",
+        action="store_true",
+        help="Add a technical-indicator overlay using RSI, MACD, Bollinger Bands, ADX, and Stochastic (requires Alpha Vantage)",
+    )
+    parser.add_argument(
+        "--technical-momentum-weight",
+        type=float,
+        default=0.05,
+        help="Weight for technical-indicator momentum overlay in composite score",
+    )
+
     parser.add_argument("--dividend-payout-cap", type=float, default=0.85)
     parser.add_argument("--max-distance-from-high", type=float, default=0.15)
     parser.add_argument("--require-above-200dma", action="store_true")
@@ -677,7 +700,7 @@ def _issuer_matches_region(metrics: Dict[str, Any], region: str) -> bool:
 
 
 def _resolve_strict_issuer_identity(
-    client: EODHDClient,
+    client: DataProvider,
     symbol: str,
     fundamentals: Dict[str, Any],
     metrics: Dict[str, Any],
@@ -909,18 +932,49 @@ def _clone_ranker_config(config: RankerConfig, **overrides: Any) -> RankerConfig
     return replace(config, **overrides)
 
 
-def _make_client(config: RankerConfig) -> EODHDClient:
-    return EODHDClient(
-        api_token=config.api_token,
-        cache_dir=config.cache_dir,
-        refresh=config.refresh,
+def _make_client(config: RankerConfig) -> DataProvider:
+    mode = getattr(config, "data_provider", "eodhd") or "eodhd"
+    cache_dir = config.cache_dir
+
+    eodhd_client: EODHDClient | None = None
+    av_client: AlphaVantageClient | None = None
+    edgar_client: SECEdgarClient | None = None
+
+    if mode in ("eodhd", "hybrid"):
+        eodhd_client = EODHDClient(
+            api_token=config.api_token,
+            cache_dir=cache_dir,
+            refresh=config.refresh,
+        )
+
+    av_key = getattr(config, "alpha_vantage_api_key", "") or ""
+    if mode in ("alpha_vantage", "hybrid") and av_key:
+        av_client = AlphaVantageClient(
+            api_key=av_key,
+            cache_dir=cache_dir,
+            refresh=config.refresh,
+        )
+
+    edgar_email = getattr(config, "sec_edgar_email", "") or ""
+    if edgar_email and "@" in edgar_email:
+        edgar_client = SECEdgarClient(
+            email=edgar_email,
+            cache_dir=cache_dir,
+            refresh=config.refresh,
+        )
+
+    return DataProvider(
+        mode=mode,
+        eodhd_client=eodhd_client,
+        av_client=av_client,
+        edgar_client=edgar_client,
     )
 
 
-def _thread_local_client_provider(config: RankerConfig) -> Callable[[], EODHDClient]:
+def _thread_local_client_provider(config: RankerConfig) -> Callable[[], DataProvider]:
     local = threading.local()
 
-    def _get_client() -> EODHDClient:
+    def _get_client() -> DataProvider:
         client = getattr(local, "client", None)
         if client is None:
             client = _make_client(config)
@@ -930,7 +984,7 @@ def _thread_local_client_provider(config: RankerConfig) -> Callable[[], EODHDCli
     return _get_client
 
 
-def _resolve_client(client_or_provider: EODHDClient | Callable[[], EODHDClient]) -> EODHDClient:
+def _resolve_client(client_or_provider: DataProvider | Callable[[], DataProvider]) -> DataProvider:
     if callable(client_or_provider):
         return client_or_provider()
     return client_or_provider
@@ -963,6 +1017,7 @@ def _stage2_overlay_requested(config: RankerConfig) -> bool:
         getattr(config, "use_pead", False)
         or getattr(config, "use_sentiment", False)
         or getattr(config, "use_insider_conviction", False)
+        or getattr(config, "use_technical_momentum", False)
         or _news_overlay_requested(config)
     )
 
@@ -1051,7 +1106,7 @@ def _parse_weight_grid(raw_value: str) -> list[float]:
 
 
 def fetch_core_symbol(
-    client: EODHDClient | Callable[[], EODHDClient],
+    client: DataProvider | Callable[[], DataProvider],
     symbol: str,
     config: RankerConfig,
     region: str,
@@ -1191,7 +1246,7 @@ def fetch_core_symbol(
 
 
 def enrich_overlay_symbol(
-    client: EODHDClient | Callable[[], EODHDClient],
+    client: DataProvider | Callable[[], DataProvider],
     row: Dict[str, Any],
     config: RankerConfig,
 ) -> Dict[str, Any]:
@@ -1255,10 +1310,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
-    api_token = args.api_token or os.getenv("EODHD_API_TOKEN")
-    if not api_token:
-        print("Error: missing API token. Use --api-token or set EODHD_API_TOKEN.", file=sys.stderr)
+    data_provider_mode = getattr(args, "data_provider", "eodhd") or "eodhd"
+
+    api_token = args.api_token or os.getenv("EODHD_API_TOKEN") or ""
+    if not api_token and data_provider_mode in ("eodhd", "hybrid"):
+        print("Error: missing EODHD API token. Use --api-token or set EODHD_API_TOKEN.", file=sys.stderr)
         return 2
+
+    av_api_key = getattr(args, "alpha_vantage_api_key", None) or os.getenv("ALPHA_VANTAGE_API_KEY") or ""
+    if not av_api_key and data_provider_mode in ("alpha_vantage", "hybrid"):
+        print("Error: missing Alpha Vantage API key. Use --alpha-vantage-api-key or set ALPHA_VANTAGE_API_KEY.", file=sys.stderr)
+        return 2
+
+    sec_edgar_email = getattr(args, "sec_edgar_email", None) or os.getenv("SEC_EDGAR_EMAIL") or ""
 
     initial_macro_state = (
         args.macro_state if args.macro_state != "auto" else _default_macro_state_from_regime(args.regime)
@@ -1352,6 +1416,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         analysis_from_primary_ticker=bool(args.analysis_from_primary_ticker),
         exclude_special_situations=bool(args.exclude_special_situations),
         price_momentum_source_mode="history_only" if bool(args.require_real_momentum_coverage) else "auto",
+        data_provider=data_provider_mode,
+        alpha_vantage_api_key=av_api_key,
+        sec_edgar_email=sec_edgar_email,
+        use_technical_momentum=bool(getattr(args, "use_technical_momentum", False)),
+        technical_momentum_weight=float(getattr(args, "technical_momentum_weight", 0.05)),
     )
 
     dependency_notes = _normalize_overlay_dependencies(config)
@@ -1412,6 +1481,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         feed_probe_error = _summarize_exception(exc)
         print(f"Warning: failed to inspect account feed entitlements ({feed_probe_error}).", file=sys.stderr)
+
+    if data_provider_mode != "eodhd":
+        parts = [f"Data provider: {data_provider_mode}"]
+        if av_api_key:
+            parts.append("AV=active")
+        if sec_edgar_email:
+            parts.append(f"EDGAR={sec_edgar_email}")
+        print(" | ".join(parts), file=sys.stderr)
 
     for note in dependency_notes:
         print(note, file=sys.stderr)

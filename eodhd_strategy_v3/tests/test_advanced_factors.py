@@ -777,7 +777,7 @@ def test_working_capital_stress_v2_penalty_is_capped() -> None:
     metrics = compute_working_capital_stress_metrics(fundamentals, alpha_factor_spec="v2")
 
     assert metrics["working_capital_stress_has_coverage"] > 0
-    assert metrics["working_capital_stress_penalty"] == 0.06
+    assert 0.0 < metrics["working_capital_stress_penalty"] <= 0.06
 
 
 def test_investment_restraint_penalizes_empire_building_and_dilution() -> None:

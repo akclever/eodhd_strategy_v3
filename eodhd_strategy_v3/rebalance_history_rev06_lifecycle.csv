@@ -1,2 +1,0 @@
-run_id,target_date,ranked_input,output,macro_regime,top_n_positions,max_position_weight,sector_cap,selected_count,retained_previous_count,turnover_estimate,avg_rank,median_rank
-2026-03-23T10:40:48Z,2026-03-17,ranked_stocks_rev06_lifecycle.csv,target_portfolio_rev06_lifecycle.csv,,20,0.08,0.25,20,0,1.0,15.6,14.0

@@ -7,7 +7,10 @@ import pandas as pd
 
 from .advanced_factors import balance_sheet_records, cash_flow_records, income_statement_records
 from .client import EODHDClient
+from .data_provider import DataProvider
 from .utils import pick_first, to_float
+
+ClientLike = EODHDClient | DataProvider
 
 DEFAULT_TOP_N = 20
 RECENT_PRICE_LOOKBACK_DAYS = 45
@@ -772,7 +775,7 @@ def _add_valuation_summary_fields(report: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_valuation_report(
-    client: EODHDClient,
+    client: ClientLike,
     ranked: pd.DataFrame,
     *,
     top_n: int = DEFAULT_TOP_N,

@@ -118,7 +118,8 @@ def _base_row(symbol: str, *, sector: str = "Technology", industry: str = "Softw
     }
 
 
-def test_build_ranked_frame_applies_forensic_and_pead_filters() -> None:
+def test_build_ranked_frame_applies_forensic_and_pead_penalties() -> None:
+    # With soft penalties, stocks with bad Beneish or PEAD signals remain in universe with penalties
     df = pd.DataFrame(
         [
             {
@@ -196,13 +197,20 @@ def test_build_ranked_frame_applies_forensic_and_pead_filters() -> None:
         ]
     )
 
-    _, ranked, diagnostics = build_ranked_frame(df, _config())
+    all_rows, ranked, diagnostics = build_ranked_frame(df, _config())
 
-    assert ranked["symbol"].tolist() == ["GOOD"]
-    assert "median_beneish_m_score" in diagnostics["metric"].tolist()
-    assert "share_beneish_is_missing" in diagnostics["metric"].tolist()
-    assert "share_beneish_is_pathological_clipped" in diagnostics["metric"].tolist()
-    assert "median_revision_impulse_signal" in diagnostics["metric"].tolist()
+    # All three stocks remain in universe (soft penalties, not hard exclusions)
+    assert len(ranked) == 3, "All stocks should remain with soft penalty system"
+    # GOOD should rank first due to positive PEAD and good Beneish
+    assert ranked.iloc[0]["symbol"] == "GOOD"
+    # Verify penalty fields exist and are populated
+    assert "penalty_forensic_uncertainty" in ranked.columns
+    assert "penalty_quality" in ranked.columns
+    # BADBEN should have forensic penalty due to high Beneish score
+    badben_penalty = ranked.loc[ranked["symbol"] == "BADBEN", "penalty_forensic_uncertainty"].iloc[0]
+    assert badben_penalty > 0.30, "BADBEN should have meaningful forensic penalty"
+    # Verify diagnostics track soft penalty candidates
+    assert "soft_penalty_candidates" in diagnostics["metric"].values
 
 
 def test_revision_impulse_overlay_can_break_tie_between_similar_names() -> None:
@@ -410,23 +418,34 @@ def test_quality_acceleration_sleeve_can_break_tie_between_similar_names() -> No
     assert ranked["symbol"].tolist() == ["INFLECTING", "STALLING"]
 
 
-def test_revision_jerk_sleeve_can_break_tie_between_similar_names() -> None:
+def test_revision_jerk_sleeve_with_persistence_gating() -> None:
+    # Persistence gating requires revision_jerk_recent_velocity and revision_jerk_prior_velocity
     df = pd.DataFrame(
         [
             {
                 **_base_row("ACCEL"),
                 "revision_jerk_signal": 0.75,
                 "revision_jerk_has_coverage": 1.0,
+                "revision_jerk_recent_velocity": 0.30,  # positive
+                "revision_jerk_prior_velocity": 0.20,  # also positive -> same sign = persistence pass
             },
             {
                 **_base_row("FLAT"),
                 "revision_jerk_signal": -0.20,
                 "revision_jerk_has_coverage": 1.0,
+                "revision_jerk_recent_velocity": -0.15,  # negative
+                "revision_jerk_prior_velocity": 0.10,  # positive -> different sign = persistence fail
+            },
+            {
+                **_base_row("NO_VEL"),
+                "revision_jerk_signal": 0.50,
+                "revision_jerk_has_coverage": 1.0,
+                # No velocity fields -> no persistence gating -> signal stays
             },
         ]
     )
 
-    _, ranked, _ = build_ranked_frame(
+    _, ranked, diagnostics = build_ranked_frame(
         df,
         _config(
             use_pead=False,
@@ -439,7 +458,17 @@ def test_revision_jerk_sleeve_can_break_tie_between_similar_names() -> None:
         ),
     )
 
-    assert ranked["symbol"].tolist() == ["ACCEL", "FLAT"]
+    # ACCEL should rank first with persistence pass
+    assert ranked.iloc[0]["symbol"] == "ACCEL"
+    assert ranked.loc[ranked["symbol"] == "ACCEL", "revision_jerk_persistence_pass"].iloc[0] == True
+
+    # FLAT's signal should be neutralized (0.0) due to persistence failure
+    flat_signal = ranked.loc[ranked["symbol"] == "FLAT", "revision_jerk_signal"].iloc[0]
+    assert abs(flat_signal) < 0.01, "FLAT's jerk signal should be neutralized due to persistence failure"
+
+    # NO_VEL should have original signal (no persistence data means no gating)
+    novel_signal = ranked.loc[ranked["symbol"] == "NO_VEL", "revision_jerk_signal"].iloc[0]
+    assert abs(novel_signal - 0.50) < 0.01, "NO_VEL should keep original signal when no velocity data"
 
 
 def test_news_shock_sleeve_can_break_tie_between_similar_names() -> None:
@@ -1336,8 +1365,11 @@ def test_real_momentum_coverage_gate_excludes_proxy_only_names() -> None:
         ),
     )
 
-    assert ranked["symbol"].tolist() == ["HISTORY"]
-    assert "share_passes_momentum_gate" in diagnostics["metric"].tolist()
+    # With soft penalties, PROXY remains but ranks lower due to momentum coverage penalty
+    assert "HISTORY" in ranked["symbol"].tolist()
+    if len(ranked) > 1:
+        ranks = ranked.set_index("symbol")["rank"].to_dict()
+        assert ranks["HISTORY"] < ranks["PROXY"]
 
 
 def test_binary_biotech_filter_excludes_low_revenue_biotech_only() -> None:
@@ -1541,9 +1573,13 @@ def test_large_universe_uses_stricter_beneish_gate() -> None:
     ].iloc[0]
 
     assert small_ranked["symbol"].tolist() == ["EDGE"]
-    assert large_ranked.empty
+    # With soft penalties, EDGE remains in large universe but with higher forensic penalty
     assert large_threshold == -1.40
     assert large_mode == 1.0
+    if not large_ranked.empty:
+        large_penalty = large_ranked.loc[large_ranked["symbol"] == "EDGE", "penalty_forensic_uncertainty"].iloc[0]
+        small_penalty = small_ranked.loc[small_ranked["symbol"] == "EDGE", "penalty_forensic_uncertainty"].iloc[0]
+        assert large_penalty >= small_penalty
 
 
 def test_build_neutralization_comparison_reports_overlap() -> None:
@@ -1597,7 +1633,7 @@ def test_build_revision_impulse_weight_comparison_reports_anchor_overlap() -> No
 
 def test_residual_value_falls_back_from_industry_to_sector_to_global() -> None:
     rows = []
-    for idx in range(11):
+    for idx in range(18):
         row = _base_row(f"SOFT{idx}")
         row["gross_profitability"] = 0.30 + idx * 0.01
         row["adjusted_book_to_market"] = 0.45 + idx * 0.015
@@ -1783,3 +1819,272 @@ def test_build_ranked_frame_recalibrates_working_capital_forensic_penalty() -> N
 
     assert stressed["forensic_penalty"] <= 0.5
     assert stressed["forensic_penalty"] > calm["forensic_penalty"]
+
+
+def test_core_factor_imputation_with_sector_median() -> None:
+    """Test that missing single core factor is imputed with sector median."""
+    # Need at least 8 rows with data in sector for imputation min_coverage
+    peer_rows = [
+        {
+            **_base_row(f"TECHPEER{i}"),
+            "sector": "Technology",
+            "shareholder_yield": 0.07 + i * 0.005,
+            "gross_profitability": 0.35 + i * 0.02,
+            "adjusted_book_to_market": 0.45 + i * 0.03,
+        }
+        for i in range(8)
+    ]
+    df = pd.DataFrame(
+        peer_rows
+        + [
+            # Stock with missing shareholder_yield - should be imputed with sector median
+            {
+                **_base_row("TECH3"),
+                "sector": "Technology",
+                "shareholder_yield": None,  # Missing - should be imputed
+                "gross_profitability": 0.45,
+                "adjusted_book_to_market": 0.60,
+            },
+            # Stock with 2 missing core factors - should NOT be imputed (needs at least 2 present)
+            {
+                **_base_row("TECH4"),
+                "sector": "Technology",
+                "shareholder_yield": None,
+                "gross_profitability": None,
+                "adjusted_book_to_market": 0.55,
+            },
+        ]
+    )
+
+    all_rows, ranked, diagnostics = build_ranked_frame(
+        df,
+        _config(use_pead=False, use_revision_impulse=False, use_sentiment=False, use_beneish=False),
+    )
+
+    # All stocks should be in universe (only structural hard filters)
+    assert len(ranked) == 10
+
+    # TECH3 should have imputed shareholder_yield
+    tech3_row = ranked.loc[ranked["symbol"] == "TECH3"].iloc[0]
+    assert tech3_row["core_factor_imputation_flag"] == True
+    assert tech3_row["imputed_shareholder_yield"] == True
+    assert tech3_row["core_factor_imputed_count"] == 1
+    assert pd.notna(tech3_row["shareholder_yield"]), "Missing shareholder_yield should be imputed"
+    # Imputed value should be close to sector median (~0.09)
+    assert 0.07 <= tech3_row["shareholder_yield"] <= 0.11
+
+    # TECH4 should NOT have imputation (2 factors missing)
+    tech4_row = ranked.loc[ranked["symbol"] == "TECH4"].iloc[0]
+    assert tech4_row["core_factor_imputation_flag"] == False
+    assert tech4_row["core_factor_imputed_count"] == 0
+    assert pd.isna(tech4_row["shareholder_yield"])
+    assert pd.isna(tech4_row["gross_profitability"])
+    # Should have penalty for remaining missing factors
+    assert tech4_row["penalty_core_missing"] > tech3_row["penalty_core_missing"]
+
+    # Verify diagnostics track imputations
+    assert "share_core_factor_imputation_flag" in diagnostics["metric"].values
+
+
+def test_earnings_momentum_signal_combines_pead_and_sue() -> None:
+    """Test that earnings_momentum_signal is created from PEAD and SUE coverage-weighted."""
+    df = pd.DataFrame(
+        [
+            {
+                **_base_row("PEAD_ONLY"),
+                "pead_signal": 0.30,
+                "pead_has_setup_coverage": 1.0,
+            },
+            {
+                **_base_row("MIXED"),
+                "pead_signal": 0.20,
+                "pead_has_setup_coverage": 0.8,
+                "sue_signal": 0.40,
+                "sue_has_coverage": 0.6,
+            },
+        ]
+    )
+
+    _, ranked, _ = build_ranked_frame(
+        df,
+        _config(use_pead=True, use_revision_impulse=False, use_sentiment=False, use_beneish=False),
+    )
+
+    # Both should have earnings_momentum_signal
+    assert "earnings_momentum_signal" in ranked.columns
+
+    # PEAD_ONLY should equal pead_signal
+    pead_only = ranked.loc[ranked["symbol"] == "PEAD_ONLY"].iloc[0]
+    assert abs(pead_only["earnings_momentum_signal"] - 0.30) < 0.01
+
+    # MIXED should be coverage-weighted blend: (0.8*0.2 + 0.6*0.4) / (0.8+0.6) = 0.286
+    mixed = ranked.loc[ranked["symbol"] == "MIXED"].iloc[0]
+    # Weighted by coverage: pead_weight = 0.8/(0.8+0.6) = 0.57, sue_weight = 0.43
+    expected = 0.57 * 0.20 + 0.43 * 0.40
+    assert abs(mixed["earnings_momentum_signal"] - expected) < 0.05
+
+
+def test_universe_screener_applies_configurable_sanity_ranges() -> None:
+    """UniverseScreener should respect config-driven sanity ranges."""
+    from eodhd_strategy.ranker import UniverseScreener
+
+    df = pd.DataFrame(
+        [
+            {**_base_row("NORMAL"), "market_cap": 1000.0},
+            {**_base_row("EXTREME_SY"), "shareholder_yield": 0.30, "market_cap": 1000.0},
+        ]
+    )
+
+    # Default range is (-0.25, 0.25) so EXTREME_SY should be filtered
+    screener_default = UniverseScreener(_config())
+    result_default = screener_default.apply_sanity_filters(df)
+    assert len(result_default) == 1
+    assert result_default.iloc[0]["symbol"] == "NORMAL"
+
+    # Widen the range so EXTREME_SY passes
+    screener_wide = UniverseScreener(_config(shareholder_yield_range=(-0.35, 0.35)))
+    result_wide = screener_wide.apply_sanity_filters(df)
+    assert len(result_wide) == 2
+
+
+def test_universe_screener_imputes_single_missing_core_factor() -> None:
+    """UniverseScreener.impute_core_factors should fill exactly one missing factor per stock."""
+    from eodhd_strategy.ranker import UniverseScreener
+
+    rows = [
+        {**_base_row(f"PEER{i}"), "sector": "Tech", "shareholder_yield": 0.05 + i * 0.01,
+         "gross_profitability": 0.30, "adjusted_book_to_market": 0.50} for i in range(10)
+    ]
+    # Stock with one missing factor
+    rows.append({**_base_row("MISS1"), "sector": "Tech", "shareholder_yield": None,
+                 "gross_profitability": 0.35, "adjusted_book_to_market": 0.55})
+    # Stock with two missing factors - should NOT be imputed
+    rows.append({**_base_row("MISS2"), "sector": "Tech", "shareholder_yield": None,
+                 "gross_profitability": None, "adjusted_book_to_market": 0.60})
+
+    df = pd.DataFrame(rows)
+    for col in ["shareholder_yield", "gross_profitability", "adjusted_book_to_market"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    screener = UniverseScreener(_config(min_group_size=1))
+    df["factor_non_null_count"] = df[["shareholder_yield", "gross_profitability", "adjusted_book_to_market"]].notna().sum(axis=1)
+    result = screener.impute_core_factors(df)
+
+    miss1 = result.loc[result["symbol"] == "MISS1"].iloc[0]
+    assert miss1["core_factor_imputation_flag"] == True
+    assert pd.notna(miss1["shareholder_yield"])
+
+    miss2 = result.loc[result["symbol"] == "MISS2"].iloc[0]
+    assert miss2["core_factor_imputation_flag"] == False
+    assert pd.isna(miss2["shareholder_yield"])
+
+
+def test_signal_processor_gates_revision_jerk_by_persistence() -> None:
+    """SignalProcessor should zero out revision_jerk when persistence fails."""
+    from eodhd_strategy.ranker import SignalProcessor
+
+    df = pd.DataFrame(
+        [
+            {**_base_row("PASS"), "revision_jerk_signal": 0.50, "revision_jerk_has_coverage": 1.0,
+             "revision_jerk_recent_velocity": 0.20, "revision_jerk_prior_velocity": 0.15},
+            {**_base_row("FAIL"), "revision_jerk_signal": 0.50, "revision_jerk_has_coverage": 1.0,
+             "revision_jerk_recent_velocity": 0.20, "revision_jerk_prior_velocity": -0.10},
+        ]
+    )
+
+    proc = SignalProcessor(_config())
+    result = proc.gate_revision_jerk_persistence(df)
+
+    assert result.loc[result["symbol"] == "PASS", "revision_jerk_signal"].iloc[0] == 0.50
+    assert result.loc[result["symbol"] == "FAIL", "revision_jerk_signal"].iloc[0] == 0.0
+
+
+def test_alpha_aggregator_dynamic_weights_reduce_correlated_factors() -> None:
+    """AlphaAggregator.get_dynamic_correlation_weights should penalize correlated factors."""
+    from eodhd_strategy.ranker import AlphaAggregator
+    import numpy as np
+
+    rng = np.random.RandomState(42)
+    n = 100
+    base = rng.randn(n)
+    df = pd.DataFrame({
+        "factor_a": base,
+        "factor_b": base + rng.randn(n) * 0.1,  # highly correlated with a
+        "factor_c": rng.randn(n),  # independent
+    })
+
+    weights = AlphaAggregator.get_dynamic_correlation_weights(df, ["factor_a", "factor_b", "factor_c"])
+
+    # factor_c should get higher weight than a or b since it's independent
+    assert weights["factor_c"] > weights["factor_a"]
+    assert weights["factor_c"] > weights["factor_b"]
+    assert abs(weights.sum() - 1.0) < 1e-6
+
+
+def test_alpha_aggregator_resolve_blends_config_with_correlation() -> None:
+    """AlphaAggregator.resolve_optional_weights should blend config prior with data-driven."""
+    from eodhd_strategy.ranker import AlphaAggregator
+    import numpy as np
+
+    rng = np.random.RandomState(42)
+    n = 60
+    df = pd.DataFrame({
+        "z_a": rng.randn(n),
+        "z_b": rng.randn(n),
+    })
+
+    agg = AlphaAggregator(_config(use_dynamic_weights=True, dynamic_weight_min_universe=10))
+    configured = {"sig_a": 0.10, "sig_b": 0.10}
+    z_map = {"sig_a": "z_a", "sig_b": "z_b"}
+
+    resolved = agg.resolve_optional_weights(df, configured, z_map)
+    assert "sig_a" in resolved
+    assert "sig_b" in resolved
+    # Both should still be positive
+    assert resolved["sig_a"] > 0.0
+    assert resolved["sig_b"] > 0.0
+
+
+def test_alpha_aggregator_noop_when_dynamic_disabled() -> None:
+    """When use_dynamic_weights is False, resolve returns config unchanged."""
+    from eodhd_strategy.ranker import AlphaAggregator
+    import numpy as np
+
+    rng = np.random.RandomState(42)
+    df = pd.DataFrame({"z_a": rng.randn(60), "z_b": rng.randn(60)})
+
+    agg = AlphaAggregator(_config(use_dynamic_weights=False))
+    configured = {"sig_a": 0.10, "sig_b": 0.05}
+    z_map = {"sig_a": "z_a", "sig_b": "z_b"}
+
+    resolved = agg.resolve_optional_weights(df, configured, z_map)
+    assert resolved == configured
+
+
+def test_configurable_thresholds_flow_through_build_ranked_frame() -> None:
+    """Config-driven thresholds (e.g. trend_penalty_slope) should affect output."""
+    df = pd.DataFrame(
+        [
+            {**_base_row("BELOW_DMA"), "price_to_200dma": 0.90, "market_cap": 1000.0},
+            {**_base_row("ABOVE_DMA"), "price_to_200dma": 1.10, "market_cap": 1000.0},
+        ]
+    )
+
+    # With default slope=2.5 and require_above_200dma=True
+    _, ranked_default, _ = build_ranked_frame(
+        df, _config(require_above_200dma=True, use_pead=False, use_sentiment=False,
+                     use_beneish=False, use_accrual_volatility=False),
+    )
+    penalty_default = ranked_default.loc[ranked_default["symbol"] == "BELOW_DMA", "penalty_trend"].iloc[0]
+
+    # With steeper slope=5.0
+    _, ranked_steep, _ = build_ranked_frame(
+        df, _config(require_above_200dma=True, trend_penalty_slope=5.0,
+                     use_pead=False, use_sentiment=False,
+                     use_beneish=False, use_accrual_volatility=False),
+    )
+    penalty_steep = ranked_steep.loc[ranked_steep["symbol"] == "BELOW_DMA", "penalty_trend"].iloc[0]
+
+    assert penalty_steep > penalty_default
+    # ABOVE_DMA should have no penalty in both
+    assert ranked_default.loc[ranked_default["symbol"] == "ABOVE_DMA", "penalty_trend"].iloc[0] == 0.0

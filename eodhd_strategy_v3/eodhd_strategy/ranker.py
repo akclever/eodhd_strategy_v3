@@ -9,6 +9,13 @@ from .config import RankerConfig
 from .macro_states import get_macro_factor_weights
 from .utils import robust_zscore
 
+try:
+    from sklearn.linear_model import HuberRegressor
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
 CORE_FACTORS = ["shareholder_yield", "gross_profitability", "adjusted_book_to_market"]
 OPTIONAL_CORE_FACTORS = ["residual_value_signal", "compounder_persistence_signal"]
 BASE_BENEISH_HARD_FILTER_THRESHOLD = -1.20
@@ -16,6 +23,10 @@ LARGE_UNIVERSE_BENEISH_HARD_FILTER_THRESHOLD = -1.40
 LARGE_UNIVERSE_MIN_SIZE = 1000
 LIFE_CYCLE_STAGES = ("growth", "mature", "recovery")
 
+
+# ---------------------------------------------------------------------------
+# Pure utility helpers (no business logic)
+# ---------------------------------------------------------------------------
 
 def _empty_series_for_dtype(dtype: object, index: pd.Index) -> pd.Series:
     if pd.api.types.is_bool_dtype(dtype):
@@ -58,12 +69,17 @@ def _groupwise_robust_zscore(
     global_z = robust_zscore(df[value_col])
     result = global_z.copy()
 
-    for _, idx in df.groupby(group_col, dropna=False).groups.items():
-        idx = list(idx)
-        chunk = df.loc[idx, value_col]
-        if chunk.notna().sum() >= min_group_size:
-            result.loc[idx] = robust_zscore(chunk)
+    if group_col not in df.columns:
+        return result
 
+    def _apply_group_zscore(chunk: pd.Series) -> pd.Series:
+        if chunk.notna().sum() >= min_group_size:
+            return robust_zscore(chunk)
+        return pd.Series(np.nan, index=chunk.index, dtype=float)
+
+    group_z = df.groupby(group_col, dropna=False)[value_col].transform(_apply_group_zscore)
+    has_group_z = group_z.notna()
+    result.loc[has_group_z] = group_z.loc[has_group_z]
     return result
 
 
@@ -71,13 +87,11 @@ def add_factor_zscores(df: pd.DataFrame, config: RankerConfig) -> pd.DataFrame:
     out = df.copy()
     group_col = None if config.neutralize_by == "none" else config.neutralize_by
 
-    factor_list = CORE_FACTORS + ["pead_signal"]
+    factor_list = CORE_FACTORS + ["earnings_momentum_signal"]
     if getattr(config, "use_residual_valuation", False):
         factor_list += ["residual_value_signal"]
     if getattr(config, "use_compounder_persistence", False):
         factor_list += ["compounder_persistence_signal"]
-    if getattr(config, "use_pead", False):
-        factor_list += ["sue_signal"]
     if getattr(config, "use_revision_impulse", False):
         factor_list += ["revision_impulse_signal"]
     if getattr(config, "use_revision_jerk", False):
@@ -108,6 +122,8 @@ def add_factor_zscores(df: pd.DataFrame, config: RankerConfig) -> pd.DataFrame:
         factor_list += ["news_theme_drift_signal"]
     if getattr(config, "use_employee_efficiency", False):
         factor_list += ["revenue_per_employee", "gross_profit_per_employee"]
+    if getattr(config, "use_technical_momentum", False):
+        factor_list += ["technical_momentum_signal"]
 
     for factor in factor_list:
         z_col = f"z_{factor}"
@@ -251,6 +267,76 @@ def _ols_residuals(
     return residuals
 
 
+def _huber_residuals(
+    frame: pd.DataFrame,
+    response_col: str,
+    predictor_cols: list[str],
+    *,
+    min_samples: int = 16,
+) -> tuple[pd.Series, bool]:
+    """
+    Compute residuals using Huber regression with standardized predictors.
+    Returns (residuals, used_fallback) tuple.
+    Falls back to winsorized OLS on fit failure or insufficient samples.
+    """
+    residuals = pd.Series(np.nan, index=frame.index, dtype=float)
+    used_fallback = False
+
+    usable_predictors = [col for col in predictor_cols if col in frame.columns and frame[col].notna().any()]
+    if response_col not in frame.columns or not usable_predictors:
+        return residuals, used_fallback
+
+    design = frame[[response_col] + usable_predictors].apply(pd.to_numeric, errors="coerce").dropna()
+    min_required = max(min_samples, len(usable_predictors) + 5)
+    if len(design) < min_required:
+        return residuals, used_fallback
+
+    if not SKLEARN_AVAILABLE:
+        # Fall back to winsorized OLS if sklearn not available
+        fallback_residuals = _ols_residuals(frame, response_col, predictor_cols, winsorize=True)
+        return fallback_residuals, True
+
+    try:
+        # Standardize predictors and response
+        scaler_X = StandardScaler()
+        scaler_y = StandardScaler()
+
+        X_raw = design[usable_predictors].to_numpy(dtype=float)
+        y_raw = design[response_col].to_numpy(dtype=float).reshape(-1, 1)
+
+        X_scaled = scaler_X.fit_transform(X_raw)
+        y_scaled = scaler_y.fit_transform(y_raw).ravel()
+
+        # Winsorize scaled values for additional robustness
+        for i in range(X_scaled.shape[1]):
+            col_data = X_scaled[:, i]
+            q05, q95 = np.percentile(col_data, [5, 95])
+            X_scaled[:, i] = np.clip(col_data, q05, q95)
+
+        y_q05, y_q95 = np.percentile(y_scaled, [5, 95])
+        y_scaled = np.clip(y_scaled, y_q05, y_q95)
+
+        # Fit Huber regression
+        huber = HuberRegressor(epsilon=1.35, max_iter=100, alpha=0.0001)
+        huber.fit(X_scaled, y_scaled)
+
+        # Compute residuals in original scale
+        y_pred_scaled = huber.predict(X_scaled)
+        residuals_scaled = y_scaled - y_pred_scaled
+        residuals_std = scaler_y.scale_[0] if hasattr(scaler_y, 'scale_') and len(scaler_y.scale_) > 0 else 1.0
+        residuals_original = residuals_scaled * residuals_std
+
+        residuals.loc[design.index] = residuals_original
+
+    except Exception:
+        # Fall back to winsorized OLS on any error
+        fallback_residuals = _ols_residuals(frame, response_col, predictor_cols, winsorize=True)
+        residuals = fallback_residuals
+        used_fallback = True
+
+    return residuals, used_fallback
+
+
 def _residualize_against_predictors(
     response: pd.Series,
     predictors: dict[str, pd.Series],
@@ -302,6 +388,11 @@ def _build_residual_value_signal(eligible: pd.DataFrame, config: RankerConfig) -
         out["residual_value_peer_level"] = pd.Series(pd.NA, index=out.index, dtype="object")
     else:
         out["residual_value_peer_level"] = out["residual_value_peer_level"].astype("object")
+
+    # Track residual regression backend and fallback usage
+    out["residual_regression_backend"] = "huber" if SKLEARN_AVAILABLE else "ols"
+    out["residual_regression_fallback"] = 0.0
+
     use_v2 = str(getattr(config, "alpha_factor_spec", "legacy") or "legacy").lower() == "v2"
 
     predictors = [
@@ -312,42 +403,70 @@ def _build_residual_value_signal(eligible: pd.DataFrame, config: RankerConfig) -
     if use_v2 and "estimate_term_structure_signal" in out.columns and out["estimate_term_structure_signal"].notna().any():
         predictors.append("estimate_term_structure_signal")
     if not predictors or "adjusted_book_to_market" not in out.columns:
+        out["residual_regression_backend"] = "none"
         return out
 
-    global_residuals = _ols_residuals(out, "adjusted_book_to_market", predictors, winsorize=use_v2)
+    # Use Huber regression with fallback to winsorized OLS
+    global_residuals, global_fallback = _huber_residuals(out, "adjusted_book_to_market", predictors, min_samples=16)
 
     industry_residuals: dict[object, pd.Series] = {}
+    industry_fallback: dict[object, bool] = {}
     if "industry" in out.columns:
         for industry, idx in out.groupby("industry", dropna=False).groups.items():
             subset = out.loc[list(idx)].copy()
-            residuals = _ols_residuals(subset, "adjusted_book_to_market", predictors, winsorize=use_v2)
+            residuals, used_fallback = _huber_residuals(subset, "adjusted_book_to_market", predictors, min_samples=16)
             if residuals.notna().sum() >= 12:
                 industry_residuals[industry] = residuals
+                industry_fallback[industry] = used_fallback
 
     sector_residuals: dict[object, pd.Series] = {}
+    sector_fallback: dict[object, bool] = {}
     if "sector" in out.columns:
         for sector, idx in out.groupby("sector", dropna=False).groups.items():
             subset = out.loc[list(idx)].copy()
-            residuals = _ols_residuals(subset, "adjusted_book_to_market", predictors, winsorize=use_v2)
+            residuals, used_fallback = _huber_residuals(subset, "adjusted_book_to_market", predictors, min_samples=16)
             if residuals.notna().sum() >= 12:
                 sector_residuals[sector] = residuals
+                sector_fallback[sector] = used_fallback
+
+    fallback_count = 0
+    total_assigned = 0
 
     for idx, row in out.iterrows():
         industry = row.get("industry") if "industry" in out.columns else None
         sector = row.get("sector") if "sector" in out.columns else None
 
+        assigned = False
         if industry in industry_residuals and pd.notna(industry_residuals[industry].get(idx)):
             out.at[idx, "residual_value_signal"] = float(industry_residuals[industry].loc[idx])
             out.at[idx, "residual_value_has_coverage"] = 1.0
             out.at[idx, "residual_value_peer_level"] = "industry"
+            if industry_fallback.get(industry, False):
+                fallback_count += 1
+            assigned = True
         elif sector in sector_residuals and pd.notna(sector_residuals[sector].get(idx)):
             out.at[idx, "residual_value_signal"] = float(sector_residuals[sector].loc[idx])
             out.at[idx, "residual_value_has_coverage"] = 1.0
             out.at[idx, "residual_value_peer_level"] = "sector"
+            if sector_fallback.get(sector, False):
+                fallback_count += 1
+            assigned = True
         elif pd.notna(global_residuals.get(idx)):
             out.at[idx, "residual_value_signal"] = float(global_residuals.loc[idx])
             out.at[idx, "residual_value_has_coverage"] = 1.0
             out.at[idx, "residual_value_peer_level"] = "global"
+            if global_fallback:
+                fallback_count += 1
+            assigned = True
+
+        if assigned:
+            total_assigned += 1
+
+    # Store fallback share for diagnostics
+    if total_assigned > 0:
+        out["share_residual_huber_fallback"] = fallback_count / total_assigned
+    else:
+        out["share_residual_huber_fallback"] = 0.0
 
     return out
 
@@ -362,12 +481,14 @@ def _groupwise_only_robust_zscore(
     if group_col not in df.columns or value_col not in df.columns:
         return result
 
-    for _, idx in df.groupby(group_col, dropna=False).groups.items():
-        idx = list(idx)
-        series = pd.to_numeric(df.loc[idx, value_col], errors="coerce")
-        if series.notna().sum() < min_group_size:
-            continue
-        result.loc[idx] = robust_zscore(series)
+    numeric_col = pd.to_numeric(df[value_col], errors="coerce")
+
+    def _apply_group(chunk: pd.Series) -> pd.Series:
+        if chunk.notna().sum() < min_group_size:
+            return pd.Series(np.nan, index=chunk.index, dtype=float)
+        return robust_zscore(chunk)
+
+    result = numeric_col.groupby(df[group_col], dropna=False).transform(_apply_group)
     return result
 
 
@@ -454,34 +575,24 @@ def _groupwise_peer_signal(
 
     values = pd.to_numeric(frame[value_col], errors="coerce").fillna(0.0)
     weights = pd.to_numeric(frame[weight_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    active = (weights > 0.0).astype(float)
+    eff_weights = weights * (1.0 + values.abs()) * active
 
-    for _, idx in frame.groupby(group_col, dropna=False).groups.items():
-        idx = list(idx)
-        if len(idx) <= 1:
-            continue
+    # Vectorized leave-one-out via group totals
+    grp = frame[group_col]
+    group_total_weight = eff_weights.groupby(grp, dropna=False).transform("sum")
+    group_total_signal = (values * eff_weights).groupby(grp, dropna=False).transform("sum")
+    group_active_count = active.groupby(grp, dropna=False).transform("sum")
+    group_size = grp.groupby(grp, dropna=False).transform("count")
 
-        group_values = values.loc[idx]
-        group_weights = weights.loc[idx]
-        active_mask = group_weights > 0.0
-        active_count = int(active_mask.sum())
-        if active_count <= 0:
-            continue
+    own_weight = eff_weights
+    peer_weight = group_total_weight - own_weight
+    peer_signal_total = group_total_signal - values * own_weight
+    peer_count = group_active_count - (own_weight > 0.0).astype(float)
 
-        eff_weights = (group_weights * (1.0 + group_values.abs())).where(active_mask, 0.0)
-        total_weight = float(eff_weights.sum())
-        total_signal = float((group_values * eff_weights).sum())
-        if total_weight <= 0.0:
-            continue
-
-        for label in idx:
-            own_weight = float(eff_weights.loc[label])
-            peer_weight = total_weight - own_weight
-            peer_count = active_count - (1 if own_weight > 0.0 else 0)
-            if peer_weight <= 0.0 or peer_count <= 0:
-                continue
-
-            signal.loc[label] = (total_signal - float(group_values.loc[label]) * own_weight) / peer_weight
-            coverage.loc[label] = float(min(1.0, peer_count / 5.0))
+    valid = (peer_weight > 0.0) & (peer_count > 0) & (group_size > 1)
+    signal = (peer_signal_total / peer_weight.replace(0.0, np.nan)).where(valid, 0.0).fillna(0.0)
+    coverage = (peer_count / 5.0).clip(0.0, 1.0).where(valid, 0.0).fillna(0.0)
 
     return signal, coverage
 
@@ -547,9 +658,9 @@ def _build_news_experiment_metrics(frame: pd.DataFrame, config: RankerConfig) ->
     out["news_confirmation_signal"] = 0.0
     out["news_confirmation_coverage"] = 0.0
     if getattr(config, "use_news_confirmation", False):
-        revision_support = np.tanh(4.0 * _series_or_zero(out, "revision_impulse_signal"))
-        pead_support = np.tanh(4.0 * _series_or_zero(out, "pead_signal"))
-        sue_support = np.tanh(0.75 * _series_or_zero(out, "sue_signal"))
+        revision_support = np.tanh(4.0 * _series_or_nan(out, "revision_impulse_signal").fillna(0.0))
+        pead_support = np.tanh(4.0 * _series_or_nan(out, "pead_signal").fillna(0.0))
+        sue_support = np.tanh(0.75 * _series_or_nan(out, "sue_signal").fillna(0.0))
         support_signal = 0.55 * revision_support + 0.30 * pead_support + 0.15 * sue_support
         support_coverage = (
             0.55 * _series_or_zero(out, "revision_impulse_has_coverage").clip(0.0, 1.0)
@@ -627,17 +738,17 @@ def _build_life_cycle_context(
     out = eligible.copy()
 
     strength = _clipped_life_cycle_strength(config)
-    gp = robust_zscore(_series_or_zero(out, "gross_profitability")).clip(-2.0, 2.0)
-    sy = robust_zscore(_series_or_zero(out, "shareholder_yield")).clip(-2.0, 2.0)
-    value = robust_zscore(_series_or_zero(out, "adjusted_book_to_market")).clip(-2.0, 2.0)
-    pead = robust_zscore(_series_or_zero(out, "pead_signal")).clip(-2.0, 2.0)
-    sue = robust_zscore(_series_or_zero(out, "sue_signal")).clip(-2.0, 2.0)
-    revision = robust_zscore(_series_or_zero(out, "revision_impulse_signal")).clip(-2.0, 2.0)
-    revenue_growth = robust_zscore(_series_or_zero(out, "revenue_growth_yoy")).clip(-2.0, 2.0)
-    revenue_acceleration = robust_zscore(_series_or_zero(out, "revenue_acceleration")).clip(-2.0, 2.0)
-    momentum = robust_zscore(_series_or_zero(out, "price_momentum_effective_signal")).clip(-2.0, 2.0)
-    forensic = _series_or_zero(out, "forensic_penalty").clip(-2.0, 2.0)
-    piotroski = ((_series_or_zero(out, "piotroski_score") - 5.0) / 2.0).clip(-2.0, 2.0)
+    gp = robust_zscore(_series_or_nan(out, "gross_profitability")).clip(-2.0, 2.0).fillna(0.0)
+    sy = robust_zscore(_series_or_nan(out, "shareholder_yield")).clip(-2.0, 2.0).fillna(0.0)
+    value = robust_zscore(_series_or_nan(out, "adjusted_book_to_market")).clip(-2.0, 2.0).fillna(0.0)
+    pead = robust_zscore(_series_or_nan(out, "pead_signal")).clip(-2.0, 2.0).fillna(0.0)
+    sue = robust_zscore(_series_or_nan(out, "sue_signal")).clip(-2.0, 2.0).fillna(0.0)
+    revision = robust_zscore(_series_or_nan(out, "revision_impulse_signal")).clip(-2.0, 2.0).fillna(0.0)
+    revenue_growth = robust_zscore(_series_or_nan(out, "revenue_growth_yoy")).clip(-2.0, 2.0).fillna(0.0)
+    revenue_acceleration = robust_zscore(_series_or_nan(out, "revenue_acceleration")).clip(-2.0, 2.0).fillna(0.0)
+    momentum = robust_zscore(_series_or_nan(out, "price_momentum_effective_signal")).clip(-2.0, 2.0).fillna(0.0)
+    forensic = _series_or_nan(out, "forensic_penalty").clip(-2.0, 2.0).fillna(0.0)
+    piotroski = ((_series_or_nan(out, "piotroski_score").fillna(5.0) - 5.0) / 2.0).clip(-2.0, 2.0)
 
     out["life_cycle_growth_score"] = (
         0.35 * revenue_acceleration
@@ -688,7 +799,11 @@ def _build_life_cycle_context(
     out["life_cycle_revision_impulse_multiplier"] = 1.0
     out["life_cycle_forensic_multiplier"] = 1.0
 
-    stage_templates = {
+    # Macro-aware stage templates: expansion favors growth/revision, defensive/inflation stress favor quality/preservation
+    macro_state = (getattr(config, "macro_state", "neutral") or "neutral").lower()
+
+    # Base multipliers by stage
+    base_templates = {
         "growth": {
             "shareholder_yield": 1.0 - 0.45 * strength,
             "gross_profitability": 1.0 + 0.25 * strength,
@@ -720,6 +835,44 @@ def _build_life_cycle_context(
             "forensic_multiplier": 1.0 + 0.50 * strength,
         },
     }
+
+    # Macro tilt adjustments
+    if macro_state == "expansion":
+        # Growth stage: stronger growth/revision/momentum tilt
+        # Recovery stage: lighter value emphasis
+        stage_templates = {
+            "growth": {
+                **base_templates["growth"],
+                "growth_multiplier": 1.0 + 0.65 * strength,
+                "revision_multiplier": 1.0 + 0.60 * strength,
+                "momentum_multiplier": 1.0 + 0.35 * strength,
+            },
+            "mature": base_templates["mature"],
+            "recovery": {
+                **base_templates["recovery"],
+                "adjusted_book_to_market": 1.0 + 0.25 * strength,  # lighter value
+                "shareholder_yield": 1.0 - 0.05 * strength,  # lighter yield penalty
+            },
+        }
+    elif macro_state in ("defensive", "inflation_stress"):
+        # Mature stage: reduce dividend/yield bonus, favor balance-sheet/quality
+        # Growth stage: less aggressive growth tilt
+        stage_templates = {
+            "growth": {
+                **base_templates["growth"],
+                "growth_multiplier": 1.0 + 0.35 * strength,
+                "gross_profitability": 1.0 + 0.35 * strength,
+            },
+            "mature": {
+                **base_templates["mature"],
+                "shareholder_yield": 1.0 + 0.15 * strength,  # reduced from 0.25
+                "gross_profitability": 1.0 + 0.30 * strength,  # increased quality emphasis
+                "forensic_multiplier": 1.0 + 0.20 * strength,  # stronger forensic emphasis
+            },
+            "recovery": base_templates["recovery"],
+        }
+    else:
+        stage_templates = base_templates
 
     for stage, template in stage_templates.items():
         mask = out["life_cycle_stage"] == stage
@@ -871,6 +1024,24 @@ def build_diagnostics(
                 }
             )
 
+        # Count structural hard exclusions vs soft penalty candidates
+        hard_exclusion_mask = ~(
+            all_rows.get("passes_size", pd.Series(True, index=all_rows.index))
+            & all_rows.get("passes_biotech_gate", pd.Series(True, index=all_rows.index))
+            & all_rows.get("passes_factor_gate", pd.Series(True, index=all_rows.index))
+        )
+        rows.append({"metric": "structural_hard_exclusions", "value": float(hard_exclusion_mask.mean())})
+
+        # Soft penalty candidates (would have been excluded under old hard gates)
+        soft_penalty_candidates = (
+            (all_rows.get("penalty_trend", 0.0) > 0.0)
+            | (all_rows.get("penalty_quality", 0.0) > 0.0)
+            | (all_rows.get("penalty_forensic_uncertainty", 0.0) > 0.15)  # above missing penalty
+            | (all_rows.get("penalty_core_missing", 0.0) > 0.0)
+            | (all_rows.get("penalty_momentum_coverage", 0.0) > 0.0)
+        )
+        rows.append({"metric": "soft_penalty_candidates", "value": float(soft_penalty_candidates.mean())})
+
         for col in [
             "passes_size",
             "passes_trend_gate",
@@ -881,7 +1052,17 @@ def build_diagnostics(
             "passes_biotech_gate",
             "factor_non_null_count",
             "factor_positive_count",
+            "core_factor_imputed_count",
+            "core_factor_imputation_flag",
+            "imputed_shareholder_yield",
+            "imputed_gross_profitability",
+            "imputed_adjusted_book_to_market",
             "binary_biotech_flag",
+            "penalty_trend",
+            "penalty_quality",
+            "penalty_forensic_uncertainty",
+            "penalty_core_missing",
+            "penalty_momentum_coverage",
             "pead_has_setup_coverage",
             "sue_has_coverage",
             "revision_impulse_has_coverage",
@@ -955,12 +1136,16 @@ def build_diagnostics(
                 "piotroski_score",
                 "beneish_m_score",
                 "accrual_volatility",
+                "earnings_momentum_signal",
+                "earnings_momentum_coverage",
                 "pead_signal",
                 "pead_revision_component",
                 "sue_signal",
                 "sue_surprise_pct",
                 "revision_impulse_signal",
                 "revision_jerk_signal",
+                "revision_jerk_persistence_days",
+                "revision_jerk_persistence_pass",
                 "revision_impulse_analyst_count",
                 "revision_impulse_disagreement_penalty",
                 "revision_short_divergence_component",
@@ -1005,6 +1190,7 @@ def build_diagnostics(
                 "cash_conversion_cycle_days_delta",
                 "cash_conversion_cycle_convexity",
                 "residual_value_signal",
+                "share_residual_huber_fallback",
                 "compounder_persistence_signal",
                 "compounder_persistence_measure_count",
                 "price_momentum_6m_ex_1m",
@@ -1074,6 +1260,7 @@ def build_diagnostics(
                 "quality_acceleration_signal_confidence",
                 "insider_conviction_signal_confidence",
                 "news_theme_drift_signal_confidence",
+                "technical_momentum_signal_confidence",
                 "effective_core_share",
                 "effective_optional_share",
                 "contrib_shareholder_yield",
@@ -1096,6 +1283,7 @@ def build_diagnostics(
                 "contrib_quality_acceleration",
                 "contrib_insider_conviction",
                 "contrib_news_theme_drift",
+                "contrib_technical_momentum",
                 "contrib_employee_efficiency",
                 "contrib_forensic",
             ],
@@ -1117,6 +1305,8 @@ def build_diagnostics(
                 "shareholder_yield",
                 "gross_profitability",
                 "adjusted_book_to_market",
+                "earnings_momentum_signal",
+                "earnings_momentum_coverage",
                 "pead_signal",
                 "sue_signal",
                 "revision_impulse_signal",
@@ -1151,6 +1341,8 @@ def build_diagnostics(
                 "cash_conversion_cycle_days_delta",
                 "cash_conversion_cycle_convexity",
                 "residual_value_signal",
+                "share_residual_huber_fallback",
+                "residual_regression_backend",
                 "compounder_persistence_signal",
                 "peer_relative_anomaly_signal",
                 "peer_ownership_breadth_input",
@@ -1179,6 +1371,11 @@ def build_diagnostics(
                 "quality_acceleration_signal",
                 "quality_acceleration_measure_count",
                 "recovery_transition_signal",
+                "penalty_trend",
+                "penalty_quality",
+                "penalty_forensic_uncertainty",
+                "penalty_core_missing",
+                "penalty_momentum_coverage",
                 "insider_conviction_signal",
                 "insider_ownership_confirmation_component",
                 "insider_short_crowding_penalty",
@@ -1223,6 +1420,7 @@ def build_diagnostics(
                 "quality_acceleration_signal_confidence",
                 "insider_conviction_signal_confidence",
                 "news_theme_drift_signal_confidence",
+                "technical_momentum_signal_confidence",
                 "effective_core_share",
                 "effective_optional_share",
                 "contrib_shareholder_yield",
@@ -1246,6 +1444,7 @@ def build_diagnostics(
                 "contrib_quality_acceleration",
                 "contrib_insider_conviction",
                 "contrib_news_theme_drift",
+                "contrib_technical_momentum",
                 "contrib_employee_efficiency",
                 "contrib_forensic",
             ],
@@ -1277,6 +1476,7 @@ def build_diagnostics(
                 "contrib_quality_acceleration",
                 "contrib_insider_conviction",
                 "contrib_news_theme_drift",
+                "contrib_technical_momentum",
                 "contrib_forensic",
             ],
         )
@@ -1347,6 +1547,306 @@ def _build_forensic_penalty(eligible: pd.DataFrame, config: RankerConfig) -> pd.
     return out
 
 
+# ---------------------------------------------------------------------------
+# Architectural classes: modular pipeline replacing the monolithic god function
+# ---------------------------------------------------------------------------
+
+class UniverseScreener:
+    """Handles size, liquidity, biotech flags, and hard structural exclusions."""
+
+    def __init__(self, config: RankerConfig):
+        self.config = config
+
+    def apply_sanity_filters(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Remove rows with physically impossible data (not opinion-based gating)."""
+        c = self.config
+        sy_lo, sy_hi = getattr(c, "shareholder_yield_range", (-0.25, 0.25))
+        bb_lo, bb_hi = getattr(c, "buyback_yield_range", (-0.20, 0.20))
+        gp_lo, gp_hi = getattr(c, "gross_profitability_range", (0.0, 2.0))
+        bm_lo, bm_hi = getattr(c, "adjusted_book_to_market_range", (0.0, 3.0))
+        rr_lo, rr_hi = getattr(c, "recency_ratio_range", (0.50, 1.20))
+        pd_lo, pd_hi = getattr(c, "price_to_200dma_range", (0.50, 2.50))
+
+        return df[
+            (df["market_cap"] > 0)
+            & (df["shareholder_yield"].between(sy_lo, sy_hi, inclusive="both") | df["shareholder_yield"].isna())
+            & (df["buyback_yield"].between(bb_lo, bb_hi, inclusive="both") | df["buyback_yield"].isna())
+            & (df["gross_profitability"].between(gp_lo, gp_hi, inclusive="both") | df["gross_profitability"].isna())
+            & (df["adjusted_book_to_market"].between(bm_lo, bm_hi, inclusive="both") | df["adjusted_book_to_market"].isna())
+            & (df["recency_ratio"].between(rr_lo, rr_hi, inclusive="both") | df["recency_ratio"].isna())
+            & (df["price_to_200dma"].between(pd_lo, pd_hi, inclusive="both") | df["price_to_200dma"].isna())
+        ].copy()
+
+    def apply_structural_gates(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply only hard structural gates: size, biotech, minimum core factor availability."""
+        c = self.config
+        df["passes_size"] = df["market_cap"] >= c.min_market_cap
+
+        df["binary_biotech_flag"] = _binary_biotech_flag(
+            df, min_revenue=float(getattr(c, "binary_biotech_min_revenue", 1_000_000_000.0)),
+        )
+        df["passes_biotech_gate"] = True
+        if getattr(c, "exclude_binary_biotech", False):
+            df["passes_biotech_gate"] = df["binary_biotech_flag"] < 1.0
+
+        factor_matrix = df[CORE_FACTORS].apply(pd.to_numeric, errors="coerce")
+        df["factor_non_null_count"] = factor_matrix.notna().sum(axis=1)
+        df["factor_positive_count"] = (factor_matrix > 0).sum(axis=1)
+        df["passes_factor_gate"] = df["factor_non_null_count"] >= 1
+
+        return df
+
+    def apply_soft_penalties(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compute additive soft penalty fields (not hard exclusions)."""
+        c = self.config
+        slope = getattr(c, "trend_penalty_slope", 2.5)
+        trend_cap = getattr(c, "trend_penalty_cap", 1.0)
+        quality_cap = getattr(c, "quality_penalty_cap", 0.5)
+        forensic_miss = getattr(c, "forensic_missing_penalty", 0.15)
+        impute_pen = getattr(c, "core_impute_penalty", 0.05)
+        missing_pen = getattr(c, "core_missing_penalty", 0.15)
+        momentum_pen = getattr(c, "momentum_missing_penalty", 0.10)
+
+        beneish_gate_threshold, _ = _resolved_beneish_hard_filter_threshold(c, observed_universe_size=len(df))
+        df["beneish_hard_filter_threshold"] = beneish_gate_threshold
+
+        # Trend penalty
+        df["penalty_trend"] = 0.0
+        if c.require_above_200dma:
+            price_to_dma = pd.to_numeric(df["price_to_200dma"], errors="coerce")
+            trend_penalty = pd.Series(0.0, index=df.index)
+            below_dma = price_to_dma < 1.0
+            trend_penalty.loc[below_dma] = ((1.0 - price_to_dma.loc[below_dma]) * slope).clip(0.0, trend_cap)
+            df["penalty_trend"] = trend_penalty.fillna(0.0)
+
+        # Quality penalty
+        df["penalty_quality"] = 0.0
+        piotroski = pd.to_numeric(df["piotroski_score"], errors="coerce")
+        min_pio = getattr(c, "min_piotroski_score", 4)
+        quality_penalty = ((min_pio - piotroski) / min_pio * quality_cap).clip(0.0, quality_cap)
+        quality_penalty = quality_penalty.where(piotroski.notna(), 0.0)
+        df["penalty_quality"] = quality_penalty.fillna(0.0)
+
+        # Forensic uncertainty penalty
+        df["penalty_forensic_uncertainty"] = 0.0
+        if c.use_beneish:
+            beneish_score = pd.to_numeric(df["beneish_m_score"], errors="coerce")
+            beneish_penalty = ((beneish_score - beneish_gate_threshold) / 2.0).clip(0.0, 1.0)
+            beneish_penalty = beneish_penalty.where(beneish_score.notna(), forensic_miss)
+            df["penalty_forensic_uncertainty"] = beneish_penalty.fillna(forensic_miss)
+
+        # Core missing penalty
+        df["penalty_core_missing"] = 0.0
+        imputed_count = pd.to_numeric(df.get("core_factor_imputed_count", 0.0), errors="coerce").fillna(0.0)
+        non_null_after = df[CORE_FACTORS].notna().sum(axis=1)
+        df["penalty_core_missing"] = (impute_pen * imputed_count + missing_pen * (3 - non_null_after).clip(lower=0)).fillna(0.0)
+
+        # Momentum coverage penalty
+        df["penalty_momentum_coverage"] = 0.0
+        if getattr(c, "use_price_momentum", False) and getattr(c, "require_real_momentum_coverage", False):
+            coverage = pd.to_numeric(df["price_momentum_has_coverage"], errors="coerce").fillna(0.0)
+            df["penalty_momentum_coverage"] = (1.0 - coverage.clip(0.0, 1.0)) * momentum_pen
+
+        return df
+
+    def impute_core_factors(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Impute a single missing core factor per stock with sector median."""
+        c = self.config
+        df["core_factor_imputed_count"] = 0
+        df["core_factor_imputation_flag"] = False
+        for f in CORE_FACTORS:
+            df[f"imputed_{f}"] = False
+
+        min_coverage = max(8, getattr(c, "min_group_size", 8))
+        if "sector" not in df.columns:
+            return df
+
+        # Vectorized sector median computation
+        sector_medians: dict[str, dict] = {}
+        for factor in CORE_FACTORS:
+            sector_medians[factor] = (
+                df.groupby("sector", dropna=False)[factor]
+                .transform(lambda g: g.median() if g.notna().sum() >= min_coverage else np.nan)
+            )
+
+        exactly_one_missing = df["factor_non_null_count"] == 2
+        for factor in CORE_FACTORS:
+            missing_this = df[factor].isna() & exactly_one_missing
+            has_median = sector_medians[factor].notna()
+            fill_mask = missing_this & has_median
+            if not fill_mask.any():
+                continue
+            df.loc[fill_mask, factor] = sector_medians[factor].loc[fill_mask]
+            df.loc[fill_mask, "core_factor_imputed_count"] = 1
+            df.loc[fill_mask, "core_factor_imputation_flag"] = True
+            df.loc[fill_mask, f"imputed_{factor}"] = True
+
+        return df
+
+    def select_eligible(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Return subset passing structural hard gates."""
+        return df[
+            df["passes_size"] & df["passes_biotech_gate"] & df["passes_factor_gate"]
+        ].copy()
+
+
+class SignalProcessor:
+    """Calculates raw signals and cross-sectional robust z-scores.
+
+    NaN-preserving: missing data stays NaN during signal construction.
+    fillna(0.0) is only used at the final aggregation step.
+    """
+
+    def __init__(self, config: RankerConfig):
+        self.config = config
+        self._clip = getattr(config, "zscore_clip", 2.0)
+
+    def build_earnings_momentum(self, eligible: pd.DataFrame) -> pd.DataFrame:
+        """Collapse PEAD + SUE into single earnings_momentum_signal."""
+        out = eligible
+        out["earnings_momentum_signal"] = np.nan
+        out["earnings_momentum_coverage"] = 0.0
+
+        has_pead = "pead_signal" in out.columns and out["pead_signal"].notna()
+        has_sue = "sue_signal" in out.columns and out["sue_signal"].notna()
+        pead_cov = pd.to_numeric(out.get("pead_has_setup_coverage", 0.0), errors="coerce").fillna(0.0)
+        sue_cov = pd.to_numeric(out.get("sue_has_coverage", 0.0), errors="coerce").fillna(0.0)
+
+        if getattr(self.config, "use_pead", False) and has_pead.any():
+            if has_sue.any():
+                total_cov = pead_cov + sue_cov
+                total_cov = total_cov.replace(0.0, np.nan)
+                pw = (pead_cov / total_cov).fillna(0.6)
+                sw = (sue_cov / total_cov).fillna(0.4)
+                # NaN-safe: only fill where the signal itself exists
+                pead_val = _series_or_nan(out, "pead_signal")
+                sue_val = _series_or_nan(out, "sue_signal")
+                out["earnings_momentum_signal"] = pw * pead_val.fillna(0.0) + sw * sue_val.fillna(0.0)
+                out["earnings_momentum_coverage"] = ((pead_cov + sue_cov) / 2.0).clip(0.0, 1.0)
+            else:
+                out["earnings_momentum_signal"] = out["pead_signal"]
+                out["earnings_momentum_coverage"] = pead_cov
+        return out
+
+    def gate_revision_jerk_persistence(self, eligible: pd.DataFrame) -> pd.DataFrame:
+        """Zero out revision_jerk_signal when same-sign persistence fails.
+
+        Rows without velocity data are not gated (no persistence info available).
+        """
+        min_days = getattr(self.config, "revision_jerk_persistence_min_days", 14)
+        eligible["revision_jerk_persistence_days"] = 0.0
+        eligible["revision_jerk_persistence_pass"] = False
+
+        has_velocity_data = pd.Series(False, index=eligible.index)
+        if "revision_jerk_recent_velocity" in eligible.columns and "revision_jerk_prior_velocity" in eligible.columns:
+            recent_vel = pd.to_numeric(eligible["revision_jerk_recent_velocity"], errors="coerce")
+            prior_vel = pd.to_numeric(eligible["revision_jerk_prior_velocity"], errors="coerce")
+            has_velocity_data = recent_vel.notna() & prior_vel.notna()
+            same_sign = ((recent_vel > 0) & (prior_vel > 0)) | ((recent_vel < 0) & (prior_vel < 0))
+            eligible["revision_jerk_persistence_days"] = np.where(
+                same_sign & has_velocity_data, float(min_days), 0.0,
+            )
+            eligible["revision_jerk_persistence_pass"] = eligible["revision_jerk_persistence_days"] >= float(min_days)
+
+        if "revision_jerk_signal" in eligible.columns:
+            eligible["revision_jerk_signal_raw"] = eligible["revision_jerk_signal"].copy()
+            # Only gate rows that have velocity data but fail persistence
+            persistence_fail = has_velocity_data & ~eligible["revision_jerk_persistence_pass"].fillna(False)
+            eligible.loc[persistence_fail, "revision_jerk_signal"] = 0.0
+            eligible.loc[persistence_fail, "revision_jerk_has_coverage"] = 0.0
+
+        return eligible
+
+    def add_zscores_and_clip(self, eligible: pd.DataFrame) -> pd.DataFrame:
+        """Compute cross-sectional z-scores and clip to ±zscore_clip."""
+        eligible = add_factor_zscores(eligible, self.config)
+        clip = self._clip
+        z_cols = [c for c in eligible.columns if c.startswith("z_")]
+        for col in z_cols:
+            eligible[col] = eligible[col].clip(-clip, clip)
+        return eligible
+
+
+class RiskOverlay:
+    """Calculates forensic and risk penalties."""
+
+    def __init__(self, config: RankerConfig):
+        self.config = config
+
+    def compute(self, eligible: pd.DataFrame) -> pd.DataFrame:
+        """Delegate to existing _build_forensic_penalty."""
+        return _build_forensic_penalty(eligible, self.config)
+
+
+class AlphaAggregator:
+    """Applies dynamic correlation-parity weights and computes final composite score.
+
+    Philosophy: "Penalize redundancy, reward uniqueness."
+    If Growth and Momentum are highly correlated today, their weights shrink.
+    """
+
+    def __init__(self, config: RankerConfig):
+        self.config = config
+        self._use_dynamic = getattr(config, "use_dynamic_weights", True)
+        self._min_universe = getattr(config, "dynamic_weight_min_universe", 30)
+
+    @staticmethod
+    def get_dynamic_correlation_weights(df: pd.DataFrame, active_factors: list[str]) -> pd.Series:
+        """Compute inverse-correlation parity weights across active z-score factors."""
+        factor_data = df[active_factors].dropna()
+
+        if factor_data.empty or len(factor_data) < 30:
+            return pd.Series(1.0 / len(active_factors), index=active_factors)
+
+        corr_matrix = factor_data.corr(method="spearman")
+        abs_corr = corr_matrix.abs()
+        corr_sums = abs_corr.sum(axis=1)
+
+        raw_weights = 1.0 / corr_sums
+        final_weights = raw_weights / raw_weights.sum()
+        return final_weights
+
+    def resolve_optional_weights(
+        self,
+        eligible: pd.DataFrame,
+        configured_weights: dict[str, float],
+        z_col_map: dict[str, str],
+    ) -> dict[str, float]:
+        """Optionally modulate configured optional weights with correlation parity.
+
+        When use_dynamic_weights is True, the configured weights are blended 50/50
+        with correlation-parity weights so that highly-correlated factors shrink
+        while preserving the user's intent as a prior.
+        """
+        if not self._use_dynamic or len(eligible) < self._min_universe:
+            return configured_weights
+
+        active_z_cols = [
+            z_col_map[name]
+            for name, w in configured_weights.items()
+            if w > 0.0 and z_col_map.get(name) in eligible.columns and eligible[z_col_map[name]].notna().any()
+        ]
+        if len(active_z_cols) < 2:
+            return configured_weights
+
+        corr_weights = self.get_dynamic_correlation_weights(eligible, active_z_cols)
+
+        # Map back to signal names
+        z_to_name = {v: k for k, v in z_col_map.items() if v in active_z_cols}
+        blended: dict[str, float] = {}
+        for name, cfg_w in configured_weights.items():
+            z_col = z_col_map.get(name)
+            if z_col and z_col in corr_weights.index:
+                corr_w = float(corr_weights[z_col])
+                # Blend: 50% config prior, 50% data-driven
+                total_cfg = sum(w for w in configured_weights.values() if w > 0.0) or 1.0
+                cfg_share = cfg_w / total_cfg
+                blended[name] = max(0.0, 0.5 * cfg_share + 0.5 * corr_w) * total_cfg
+            else:
+                blended[name] = cfg_w
+        return blended
+
+
 def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = raw_df.copy()
     if df.empty:
@@ -1357,6 +1857,12 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         config,
         observed_universe_size=len(df),
     )
+
+    # Instantiate pipeline classes
+    screener = UniverseScreener(config)
+    signal_proc = SignalProcessor(config)
+    risk_overlay = RiskOverlay(config)
+    aggregator = AlphaAggregator(config)
 
     numeric_cols = [
         "market_cap",
@@ -1601,6 +2107,14 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "news_theme_drift_baseline_intensity",
         "news_theme_drift_recent_article_count",
         "news_theme_drift_baseline_article_count",
+        "technical_momentum_signal",
+        "technical_momentum_has_coverage",
+        "technical_rsi_14",
+        "technical_macd_histogram",
+        "technical_bbands_pct_b",
+        "technical_adx_14",
+        "technical_stoch_k",
+        "technical_stoch_d",
         "forensic_penalty",
         "total_revenue",
         "full_time_employees",
@@ -1624,6 +2138,7 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "quality_acceleration_signal_confidence",
         "insider_conviction_signal_confidence",
         "news_theme_drift_signal_confidence",
+        "technical_momentum_signal_confidence",
         "effective_core_share",
         "effective_optional_share",
         "contrib_shareholder_yield",
@@ -1647,6 +2162,7 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "contrib_quality_acceleration",
         "contrib_insider_conviction",
         "contrib_news_theme_drift",
+        "contrib_technical_momentum",
         "contrib_employee_efficiency",
         "contrib_forensic",
         "estimate_term_structure_overlap_penalty",
@@ -1657,63 +2173,17 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df[
-        (df["market_cap"] > 0)
-        & (df["shareholder_yield"].between(-0.25, 0.25, inclusive="both") | df["shareholder_yield"].isna())
-        & (df["buyback_yield"].between(-0.20, 0.20, inclusive="both") | df["buyback_yield"].isna())
-        & (df["gross_profitability"].between(0, 2.0, inclusive="both") | df["gross_profitability"].isna())
-        & (df["adjusted_book_to_market"].between(0, 3.0, inclusive="both") | df["adjusted_book_to_market"].isna())
-        & (df["recency_ratio"].between(0.50, 1.20, inclusive="both") | df["recency_ratio"].isna())
-        & (df["price_to_200dma"].between(0.50, 2.50, inclusive="both") | df["price_to_200dma"].isna())
-    ].copy()
+    # --- UniverseScreener: sanity filters, structural gates, imputation, penalties ---
+    df = screener.apply_sanity_filters(df)
 
     if df.empty:
         return df, pd.DataFrame(), pd.DataFrame()
 
-    df["passes_size"] = df["market_cap"] >= config.min_market_cap
-    df["passes_trend_gate"] = True
-    if config.require_above_200dma:
-        df["passes_trend_gate"] = df["price_to_200dma"].isna() | (df["price_to_200dma"] >= 1.0)
+    df = screener.apply_structural_gates(df)
+    df = screener.impute_core_factors(df)
+    df = screener.apply_soft_penalties(df)
 
-    df["passes_quality_gate"] = df["piotroski_score"].isna() | (df["piotroski_score"] >= config.min_piotroski_score)
-    df["passes_forensic_gate"] = True
-    df["passes_momentum_gate"] = True
-    if getattr(config, "use_price_momentum", False) and getattr(config, "require_real_momentum_coverage", False):
-        df["passes_momentum_gate"] = pd.to_numeric(df["price_momentum_has_coverage"], errors="coerce").fillna(0.0) >= 1.0
-
-    df["binary_biotech_flag"] = _binary_biotech_flag(
-        df,
-        min_revenue=float(getattr(config, "binary_biotech_min_revenue", 1_000_000_000.0)),
-    )
-    df["passes_biotech_gate"] = True
-    if getattr(config, "exclude_binary_biotech", False):
-        df["passes_biotech_gate"] = df["binary_biotech_flag"] < 1.0
-
-    df["beneish_hard_filter_threshold"] = beneish_gate_threshold
-    if config.use_beneish:
-        beneish_score = pd.to_numeric(df["beneish_m_score"], errors="coerce")
-        beneish_pass = beneish_score.isna() | (beneish_score <= beneish_gate_threshold)
-        df["beneish_hard_filter_pass"] = np.where(
-            beneish_score.notna(),
-            beneish_pass.astype(float),
-            df["beneish_hard_filter_pass"],
-        )
-        df["passes_forensic_gate"] = beneish_pass
-
-    factor_matrix = df[CORE_FACTORS].apply(pd.to_numeric, errors="coerce")
-    df["factor_non_null_count"] = factor_matrix.notna().sum(axis=1)
-    df["factor_positive_count"] = (factor_matrix > 0).sum(axis=1)
-    df["passes_factor_gate"] = (df["factor_non_null_count"] == 3) & (df["factor_positive_count"] >= 2)
-
-    eligible = df[
-        df["passes_size"]
-        & df["passes_trend_gate"]
-        & df["passes_quality_gate"]
-        & df["passes_forensic_gate"]
-        & df["passes_factor_gate"]
-        & df["passes_momentum_gate"]
-        & df["passes_biotech_gate"]
-    ].copy()
+    eligible = screener.select_eligible(df)
 
     if eligible.empty:
         return df, eligible, build_diagnostics(
@@ -1748,47 +2218,13 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
     else:
         eligible["news_event_effective_signal"] = np.nan
 
-    eligible = add_factor_zscores(eligible, config)
-    if "z_pead_signal" in eligible.columns:
-        eligible["z_pead_signal"] = eligible["z_pead_signal"].clip(-2.0, 2.0)
-    if "z_sue_signal" in eligible.columns:
-        eligible["z_sue_signal"] = eligible["z_sue_signal"].clip(-2.0, 2.0)
-    if "z_revision_impulse_signal" in eligible.columns:
-        eligible["z_revision_impulse_signal"] = eligible["z_revision_impulse_signal"].clip(-2.0, 2.0)
-    if "z_revision_jerk_signal" in eligible.columns:
-        eligible["z_revision_jerk_signal"] = eligible["z_revision_jerk_signal"].clip(-2.0, 2.0)
-    if "z_estimate_term_structure_signal" in eligible.columns:
-        eligible["z_estimate_term_structure_signal"] = eligible["z_estimate_term_structure_signal"].clip(-2.0, 2.0)
-    if "z_revenue_growth_yoy" in eligible.columns:
-        eligible["z_revenue_growth_yoy"] = eligible["z_revenue_growth_yoy"].clip(-2.0, 2.0)
-    if "z_revenue_acceleration" in eligible.columns:
-        eligible["z_revenue_acceleration"] = eligible["z_revenue_acceleration"].clip(-2.0, 2.0)
-    if "z_residual_value_signal" in eligible.columns:
-        eligible["z_residual_value_signal"] = eligible["z_residual_value_signal"].clip(-2.0, 2.0)
-    if "z_compounder_persistence_signal" in eligible.columns:
-        eligible["z_compounder_persistence_signal"] = eligible["z_compounder_persistence_signal"].clip(-2.0, 2.0)
-    if "z_peer_relative_anomaly_signal" in eligible.columns:
-        eligible["z_peer_relative_anomaly_signal"] = eligible["z_peer_relative_anomaly_signal"].clip(-2.0, 2.0)
-    if "z_price_momentum_effective_signal" in eligible.columns:
-        eligible["z_price_momentum_effective_signal"] = eligible["z_price_momentum_effective_signal"].clip(-2.0, 2.0)
-    if "z_news_event_effective_signal" in eligible.columns:
-        eligible["z_news_event_effective_signal"] = eligible["z_news_event_effective_signal"].clip(-2.0, 2.0)
-    if "z_news_shock_signal" in eligible.columns:
-        eligible["z_news_shock_signal"] = eligible["z_news_shock_signal"].clip(-2.0, 2.0)
-    if "z_capital_allocation_quality_signal" in eligible.columns:
-        eligible["z_capital_allocation_quality_signal"] = eligible["z_capital_allocation_quality_signal"].clip(-2.0, 2.0)
-    if "z_investment_restraint_signal" in eligible.columns:
-        eligible["z_investment_restraint_signal"] = eligible["z_investment_restraint_signal"].clip(-2.0, 2.0)
-    if "z_accrual_quality_signal" in eligible.columns:
-        eligible["z_accrual_quality_signal"] = eligible["z_accrual_quality_signal"].clip(-2.0, 2.0)
-    if "z_quality_acceleration_signal" in eligible.columns:
-        eligible["z_quality_acceleration_signal"] = eligible["z_quality_acceleration_signal"].clip(-2.0, 2.0)
-    if "z_insider_conviction_signal" in eligible.columns:
-        eligible["z_insider_conviction_signal"] = eligible["z_insider_conviction_signal"].clip(-2.0, 2.0)
-    if "z_news_theme_drift_signal" in eligible.columns:
-        eligible["z_news_theme_drift_signal"] = eligible["z_news_theme_drift_signal"].clip(-2.0, 2.0)
+    # --- SignalProcessor: build composite signals, apply persistence gating, z-score ---
+    eligible = signal_proc.build_earnings_momentum(eligible)
+    eligible = signal_proc.gate_revision_jerk_persistence(eligible)
+    eligible = signal_proc.add_zscores_and_clip(eligible)
 
-    eligible = _build_forensic_penalty(eligible, config)
+    # --- RiskOverlay: forensic and risk penalties ---
+    eligible = risk_overlay.compute(eligible)
 
     core_weights = get_macro_factor_weights(
         macro_state=getattr(config, "macro_state", "neutral"),
@@ -1841,9 +2277,10 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         adjusted_book_component_weight.copy(),
     )
 
-    pead_weight = (
-        0.08
-        if config.use_pead and (eligible["pead_signal"].notna().any() or eligible["sue_signal"].notna().any())
+    # Earnings momentum weight using the new formalized earnings_momentum_signal
+    earnings_momentum_weight = (
+        float(getattr(config, "earnings_momentum_base_weight", 0.08))
+        if config.use_pead and eligible["earnings_momentum_signal"].notna().any()
         else 0.0
     )
     revision_impulse_weight = (
@@ -1882,16 +2319,29 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         if getattr(config, "use_price_momentum", False) and eligible["price_momentum_effective_signal"].notna().any()
         else 0.0
     )
+    # News demotion: cap combined news contribution to small fixed optional-share ceiling
+    max_combined_news_share = float(getattr(config, "max_combined_news_share", 0.04))
+
+    raw_news_weight = float(getattr(config, "news_event_weight", 0.0))
+    raw_news_shock_weight = float(getattr(config, "news_shock_weight", 0.0))
+
     news_weight = (
-        float(getattr(config, "news_event_weight", 0.0))
+        raw_news_weight
         if getattr(config, "use_news_events", False) and eligible["news_event_effective_signal"].notna().any()
         else 0.0
     )
     news_shock_weight = (
-        float(getattr(config, "news_shock_weight", 0.0))
+        raw_news_shock_weight
         if getattr(config, "use_news_shock", False) and eligible["news_shock_signal"].notna().any()
         else 0.0
     )
+
+    # Apply news cap: scale down if combined would exceed ceiling
+    total_news_raw = news_weight + news_shock_weight
+    if total_news_raw > max_combined_news_share:
+        news_scale = max_combined_news_share / total_news_raw
+        news_weight = news_weight * news_scale
+        news_shock_weight = news_shock_weight * news_scale
     capital_allocation_weight = (
         float(getattr(config, "capital_allocation_weight", 0.0))
         if getattr(config, "use_capital_allocation_quality", False)
@@ -1922,6 +2372,13 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         and eligible["news_theme_drift_signal"].notna().any()
         else 0.0
     )
+    technical_momentum_weight = (
+        float(getattr(config, "technical_momentum_weight", 0.0))
+        if getattr(config, "use_technical_momentum", False)
+        and "technical_momentum_signal" in eligible.columns
+        and eligible["technical_momentum_signal"].notna().any()
+        else 0.0
+    )
     peer_relative_anomaly_weight = (
         float(getattr(config, "peer_relative_anomaly_weight", 0.0))
         if getattr(config, "use_peer_relative_anomalies", False)
@@ -1950,20 +2407,12 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         )
         employee_efficiency_signal_confidence = employee_component_frame.notna().mean(axis=1).fillna(0.0).clip(0.0, 1.0)
         employee_component = employee_component_frame.mean(axis=1).fillna(0.0)
-    pead_component = (
-        eligible["z_pead_signal"].fillna(0.0)
-        if "z_pead_signal" in eligible.columns
+    # Earnings momentum component using the new formalized signal
+    earnings_component = (
+        eligible["z_earnings_momentum_signal"].fillna(0.0)
+        if "z_earnings_momentum_signal" in eligible.columns
         else pd.Series(0.0, index=eligible.index, dtype=float)
     )
-    sue_component = (
-        eligible["z_sue_signal"].fillna(0.0)
-        if "z_sue_signal" in eligible.columns
-        else pd.Series(0.0, index=eligible.index, dtype=float)
-    )
-    if getattr(config, "use_pead", False) and "sue_signal" in eligible.columns and eligible["sue_signal"].notna().any():
-        earnings_component = 0.6 * pead_component + 0.4 * sue_component
-    else:
-        earnings_component = pead_component
     revision_impulse_component = (
         eligible["z_revision_impulse_signal"].fillna(0.0)
         if "z_revision_impulse_signal" in eligible.columns
@@ -1991,14 +2440,16 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
             estimate_overlap_predictors,
         )
         eligible["estimate_term_structure_overlap_penalty"] = float(estimate_overlap_penalty)
+    _yoy_share = float(getattr(config, "growth_component_yoy_share", 0.45))
+    _accel_share = float(getattr(config, "growth_component_accel_share", 0.55))
     growth_component = (
-        0.45
+        _yoy_share
         * (
             eligible["z_revenue_growth_yoy"].fillna(0.0)
             if "z_revenue_growth_yoy" in eligible.columns
             else pd.Series(0.0, index=eligible.index, dtype=float)
         )
-        + 0.55
+        + _accel_share
         * (
             eligible["z_revenue_acceleration"].fillna(0.0)
             if "z_revenue_acceleration" in eligible.columns
@@ -2063,6 +2514,11 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
     news_theme_drift_component = (
         eligible["z_news_theme_drift_signal"].fillna(0.0)
         if "z_news_theme_drift_signal" in eligible.columns
+        else pd.Series(0.0, index=eligible.index, dtype=float)
+    )
+    technical_momentum_component = (
+        eligible["z_technical_momentum_signal"].fillna(0.0)
+        if "z_technical_momentum_signal" in eligible.columns
         else pd.Series(0.0, index=eligible.index, dtype=float)
     )
 
@@ -2244,11 +2700,16 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         * (0.30 + 0.45 * news_theme_depth + 0.25 * news_theme_balance)
     ).clip(0.0, 1.0)
 
+    eligible["technical_momentum_signal_confidence"] = (
+        _series_or_zero(eligible, "technical_momentum_has_coverage").clip(0.0, 1.0)
+        * (0.60 + 0.40 * _series_or_zero(eligible, "technical_momentum_signal").abs().clip(0.0, 1.0))
+    ).clip(0.0, 1.0)
+
     core_floor = float(np.clip(float(getattr(config, "core_weight_floor", 0.60) or 0.60), 0.0, 1.0))
     max_optional_share = max(0.0, 1.0 - core_floor)
     configured_optional_weights = {
         "peer_relative_anomaly": peer_relative_anomaly_weight,
-        "earnings": pead_weight,
+        "earnings": earnings_momentum_weight,
         "revision_impulse": revision_impulse_weight,
         "revision_jerk": revision_jerk_weight,
         "estimate_term_structure": estimate_term_structure_weight,
@@ -2263,8 +2724,34 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         "accrual_quality": accrual_quality_weight,
         "insider_conviction": insider_conviction_weight,
         "news_theme_drift": news_theme_drift_weight,
+        "technical_momentum": technical_momentum_weight,
         "employee_efficiency": employee_weight,
     }
+    # --- AlphaAggregator: optionally modulate with correlation parity ---
+    _optional_z_col_map = {
+        "peer_relative_anomaly": "z_peer_relative_anomaly_signal",
+        "earnings": "z_earnings_momentum_signal",
+        "revision_impulse": "z_revision_impulse_signal",
+        "revision_jerk": "z_revision_jerk_signal",
+        "estimate_term_structure": "z_estimate_term_structure_signal",
+        "growth": "z_revenue_acceleration",
+        "quality_acceleration": "z_quality_acceleration_signal",
+        "momentum": "z_price_momentum_effective_signal",
+        "news_event": "z_news_event_effective_signal",
+        "news_shock": "z_news_shock_signal",
+        "capital_allocation": "z_capital_allocation_quality_signal",
+        "recovery_transition": "recovery_transition_signal",
+        "investment_restraint": "z_investment_restraint_signal",
+        "accrual_quality": "z_accrual_quality_signal",
+        "insider_conviction": "z_insider_conviction_signal",
+        "news_theme_drift": "z_news_theme_drift_signal",
+        "technical_momentum": "z_technical_momentum_signal",
+        "employee_efficiency": "z_revenue_per_employee",
+    }
+    configured_optional_weights = aggregator.resolve_optional_weights(
+        eligible, configured_optional_weights, _optional_z_col_map,
+    )
+
     configured_optional_total = float(sum(configured_optional_weights.values()))
     optional_budget_scale = (
         min(1.0, max_optional_share / configured_optional_total)
@@ -2304,6 +2791,8 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         * eligible["insider_conviction_signal_confidence"].fillna(0.0),
         "news_theme_drift": scaled_optional_weights["news_theme_drift"]
         * eligible["news_theme_drift_signal_confidence"].fillna(0.0),
+        "technical_momentum": scaled_optional_weights["technical_momentum"]
+        * eligible["technical_momentum_signal_confidence"].fillna(0.0),
         "employee_efficiency": scaled_optional_weights["employee_efficiency"]
         * employee_efficiency_signal_confidence.fillna(0.0),
     }
@@ -2340,6 +2829,7 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
             "accrual_quality": optional_activation["accrual_quality"],
             "insider_conviction": optional_activation["insider_conviction"],
             "news_theme_drift": optional_activation["news_theme_drift"],
+            "technical_momentum": optional_activation["technical_momentum"],
             "employee_efficiency": optional_activation["employee_efficiency"],
         },
         eligible["effective_optional_share"],
@@ -2394,6 +2884,9 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
     eligible["contrib_news_theme_drift"] = (
         optional_effective_weights["news_theme_drift"] * news_theme_drift_component
     )
+    eligible["contrib_technical_momentum"] = (
+        optional_effective_weights["technical_momentum"] * technical_momentum_component
+    )
     eligible["contrib_employee_efficiency"] = (
         optional_effective_weights["employee_efficiency"] * employee_component
     )
@@ -2423,18 +2916,22 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         + eligible["contrib_accrual_quality"]
         + eligible["contrib_insider_conviction"]
         + eligible["contrib_news_theme_drift"]
+        + eligible["contrib_technical_momentum"]
         + eligible["contrib_employee_efficiency"]
         + eligible["contrib_forensic"]
     )
 
-    fails_pead = pd.Series(False, index=eligible.index)
+    # PEAD filter: soft penalty instead of hard exclusion
+    eligible["penalty_pead_filter"] = 0.0
     eligible["pead_has_setup_coverage"] = pd.to_numeric(eligible["pead_has_setup_coverage"], errors="coerce").fillna(0.0)
     if config.use_pead and not eligible.empty:
         fails_pead = (
             eligible["pead_has_setup_coverage"] >= 1.0
         ) & (pd.to_numeric(eligible["pead_filter_pass"], errors="coerce").fillna(1.0) < 1.0)
+        eligible.loc[fails_pead, "penalty_pead_filter"] = 0.25
 
-    fails_sentiment = pd.Series(False, index=eligible.index)
+    # Sentiment filter: soft penalty instead of hard exclusion
+    eligible["penalty_sentiment_filter"] = 0.0
     if config.use_sentiment and not eligible.empty:
         eligible["sentiment_has_coverage"] = (
             pd.to_numeric(eligible["sentiment_count_days"], errors="coerce").fillna(0.0) >= config.min_sentiment_days
@@ -2447,20 +2944,14 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
             eligible["sentiment_has_coverage"]
             & (pd.to_numeric(eligible["sentiment_filter_pass"], errors="coerce").fillna(1.0) < 1.0)
         )
+        eligible.loc[fails_sentiment, "penalty_sentiment_filter"] = 0.20
     else:
         eligible["sentiment_has_coverage"] = False
     if not getattr(config, "use_news_events", False) and not getattr(config, "use_news_shock", False):
         eligible["news_has_coverage"] = False
 
-    eligible = eligible.loc[~fails_pead & ~fails_sentiment].copy()
-    if eligible.empty:
-        return df, eligible, build_diagnostics(
-            df,
-            pd.DataFrame(),
-            beneish_gate_threshold=beneish_gate_threshold,
-            large_universe_forensic_mode=large_universe_forensic_mode,
-            universe_size=int(getattr(config, "universe_size", len(raw_df)) or len(raw_df)),
-        )
+    # Apply soft penalties to composite score
+    eligible["composite_score"] = eligible["composite_score"] - eligible["penalty_pead_filter"] - eligible["penalty_sentiment_filter"]
 
     df = _concat_missing_columns(
         df,

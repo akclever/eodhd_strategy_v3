@@ -7,7 +7,10 @@ from typing import Dict, Iterable, List
 import pandas as pd
 
 from .client import EODHDClient
+from .data_provider import DataProvider
 from .exchanges import normalize_exchange_code, requested_exchange_aliases
+
+ClientLike = EODHDClient | DataProvider
 
 
 def is_common_stock(item: Dict[str, object]) -> bool:
@@ -150,7 +153,7 @@ def load_symbols_from_file(path: str) -> List[str]:
     return [line.strip().upper() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def collect_universe(client: EODHDClient, args) -> List[str]:
+def collect_universe(client: ClientLike, args) -> List[str]:
     region = str(getattr(args, "region", "US")).upper()
     symbols: List[str] = []
     requested_exchanges = requested_exchange_aliases(getattr(args, "exchanges", ""))

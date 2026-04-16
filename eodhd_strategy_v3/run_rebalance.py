@@ -10,6 +10,7 @@ import pandas as pd
 
 from eodhd_strategy.client import EODHDClient
 from eodhd_strategy.config import PortfolioConfig
+from eodhd_strategy.data_provider import DataProvider
 from eodhd_strategy.portfolio import build_target_portfolio
 from eodhd_strategy.regime import recommend_rebalance_date
 
@@ -193,7 +194,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     api_token = args.api_token or os.getenv("EODHD_API_TOKEN")
     if api_token:
-        client = EODHDClient(api_token=api_token, cache_dir=Path(".eodhd_cache"))
+        eodhd_client = EODHDClient(api_token=api_token, cache_dir=Path(".eodhd_cache"))
+        client = DataProvider(mode="eodhd", eodhd_client=eodhd_client)
         decision = recommend_rebalance_date(
             client=client,
             start_date=args.target_date,

@@ -34,7 +34,12 @@ from .advanced_factors import (
     income_statement_records,
     passes_sentiment_coverage_gate,
 )
+from typing import Union as _Union
+
 from .client import EODHDClient
+from .data_provider import DataProvider
+
+ClientLike = _Union[EODHDClient, DataProvider]
 from .config import RankerConfig
 from .exchanges import extract_listing_exchange_codes
 from .utils import normalize_records, pick_first, to_float, utc_today_ts
@@ -209,6 +214,67 @@ NEWS_THEME_CATEGORY_SPECS_V2 = {
     },
 }
 
+# Alpha Vantage topic tags → internal category mapping
+# AV topics: earnings, ipo, mergers_and_acquisitions, financial_markets,
+#   economy_fiscal, economy_monetary, economy_macro, energy, finance,
+#   life_sciences, manufacturing, real_estate, retail_wholesale, technology
+_AV_TOPIC_TO_CATEGORY = {
+    "earnings": "earnings_positive",       # direction resolved per-article
+    "mergers_and_acquisitions": "corporate_positive",
+    "ipo": "corporate_positive",
+    "finance": "financing_stress",         # direction resolved per-article
+    "life_sciences": "approvals_positive", # direction resolved per-article
+}
+
+# AV overall_sentiment_label values: Bullish, Somewhat-Bullish, Neutral,
+# Somewhat-Bearish, Bearish
+_AV_LABEL_BIAS = {
+    "Bullish": 1.0,
+    "Somewhat-Bullish": 0.5,
+    "Neutral": 0.0,
+    "Somewhat-Bearish": -0.5,
+    "Bearish": -1.0,
+}
+
+
+def _extract_av_article_sentiment(article: Dict[str, Any]) -> tuple:
+    """Extract AV-specific sentiment fields from an article.
+
+    Returns (ticker_sentiment, relevance, label_bias, has_av_data).
+    When AV fields are not present, returns (None, None, None, False).
+    """
+    ticker_sent = article.get("av_ticker_sentiment")
+    relevance = article.get("av_relevance")
+    label = article.get("av_overall_label")
+
+    has_av = ticker_sent is not None and ticker_sent != 0.0
+    if not has_av and relevance:
+        has_av = True
+
+    label_bias = _AV_LABEL_BIAS.get(str(label), None) if label else None
+
+    return (
+        float(ticker_sent) if ticker_sent is not None else None,
+        float(relevance) if relevance is not None else None,
+        label_bias,
+        has_av,
+    )
+
+
+def _av_topic_categories(article: Dict[str, Any]) -> List[str]:
+    """Map AV topic tags on an article to internal news categories."""
+    tags = article.get("tags")
+    if not isinstance(tags, list):
+        return []
+    matched: List[str] = []
+    for tag in tags:
+        tag_str = str(tag).lower().strip()
+        cat = _AV_TOPIC_TO_CATEGORY.get(tag_str)
+        if cat:
+            matched.append(cat)
+    return matched
+
+
 NEWS_TITLE_STOPWORDS = {
     "a",
     "an",
@@ -256,7 +322,7 @@ def capitalize_expense(records: List[Dict[str, Any]], field: str, years: int, sc
     return capital if found_any else None
 
 
-def compute_trailing_dividend_cash_per_share(client: EODHDClient, symbol: str) -> Optional[float]:
+def compute_trailing_dividend_cash_per_share(client: ClientLike, symbol: str) -> Optional[float]:
     start_date = (utc_today_ts() - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
     try:
         dividends = client.get_dividends(symbol, start_date=start_date)
@@ -293,7 +359,7 @@ def compute_buyback_yield(fundamentals: Dict[str, Any], alpha_factor_spec: str =
     return to_float(metrics.get("buyback_yield"))
 
 
-def compute_sentiment_metrics(client: EODHDClient, symbol: str, lookback_days: int) -> Dict[str, Optional[float]]:
+def compute_sentiment_metrics(client: ClientLike, symbol: str, lookback_days: int) -> Dict[str, Optional[float]]:
     empty_result = {
         "sentiment_latest": None,
         "sentiment_speed": None,
@@ -322,6 +388,7 @@ def compute_sentiment_metrics(client: EODHDClient, symbol: str, lookback_days: i
 
     series = None
     if isinstance(payload, dict):
+        # EODHD format: {symbol: [{date, normalized, count}, ...]}
         for key in [symbol, symbol.upper(), symbol.lower()]:
             if key in payload and isinstance(payload[key], list):
                 series = payload[key]
@@ -330,6 +397,11 @@ def compute_sentiment_metrics(client: EODHDClient, symbol: str, lookback_days: i
             only_value = next(iter(payload.values()))
             if isinstance(only_value, list):
                 series = only_value
+        # AV format: {date_str: {date, count, normalized}, ...}
+        if series is None:
+            candidate = list(payload.values())
+            if candidate and isinstance(candidate[0], dict) and "normalized" in candidate[0]:
+                series = candidate
 
     if not isinstance(series, list) or not series:
         return empty_result
@@ -418,7 +490,7 @@ def _canonical_news_title(article: Dict[str, Any]) -> str:
 
 
 def compute_news_event_metrics(
-    client: EODHDClient,
+    client: ClientLike,
     symbol: str,
     lookback_days: int,
     alpha_factor_spec: str = "legacy",
@@ -484,22 +556,51 @@ def compute_news_event_metrics(
         polarity = to_float(sentiment.get("polarity")) if isinstance(sentiment, dict) else None
         polarity = float(polarity) if polarity is not None else 0.0
 
+        # Extract AV-specific fields when available
+        av_ticker_sent, av_relevance, av_label_bias, has_av = _extract_av_article_sentiment(article)
+
+        # Use AV ticker sentiment as polarity when available (more targeted)
+        if has_av and av_ticker_sent is not None:
+            polarity = av_ticker_sent
+
         categories = _matched_news_categories(article)
+        # Supplement keyword categories with AV topic tags
+        av_topic_cats = _av_topic_categories(article)
+        for cat in av_topic_cats:
+            if cat not in categories:
+                # Flip direction-ambiguous topic categories based on polarity
+                if polarity < -0.1 and cat in ("earnings_positive", "approvals_positive"):
+                    flipped = cat.replace("_positive", "_negative")
+                    if flipped in NEWS_EVENT_CATEGORY_SPECS:
+                        categories.append(flipped)
+                        continue
+                elif polarity < -0.1 and cat == "corporate_positive":
+                    continue  # skip positive corporate tag for negative article
+                categories.append(cat)
+
         matched_categories_all.update(categories)
         canonical_title = _canonical_news_title(article)
         if canonical_title:
             canonical_titles.append(canonical_title)
-        raw_event_bias = sum(float(NEWS_EVENT_CATEGORY_SPECS[name]["bias"]) for name in categories)
+        raw_event_bias = sum(float(NEWS_EVENT_CATEGORY_SPECS[name]["bias"]) for name in categories if name in NEWS_EVENT_CATEGORY_SPECS)
         if categories:
             event_bias = float(np.clip(raw_event_bias / max(1.5, float(len(categories))), -1.0, 1.0))
         else:
             event_bias = 0.0
 
-        article_signal = float(np.clip(0.65 * event_bias + 0.35 * polarity, -1.0, 1.0))
+        # Blend event_bias with polarity; boost with AV label bias when available
+        base_signal = 0.65 * event_bias + 0.35 * polarity
+        if av_label_bias is not None:
+            base_signal += 0.10 * av_label_bias
+        article_signal = float(np.clip(base_signal, -1.0, 1.0))
 
-        mentioned_symbols = article.get("symbols")
-        symbol_count = len(mentioned_symbols) if isinstance(mentioned_symbols, list) and mentioned_symbols else 1
-        relevance_weight = 1.0 / np.sqrt(float(max(1, symbol_count)))
+        # Use AV relevance score when available; fallback to 1/sqrt(symbol_count)
+        if has_av and av_relevance is not None and av_relevance > 0.0:
+            relevance_weight = float(np.clip(av_relevance, 0.05, 1.0))
+        else:
+            mentioned_symbols = article.get("symbols")
+            symbol_count = len(mentioned_symbols) if isinstance(mentioned_symbols, list) and mentioned_symbols else 1
+            relevance_weight = 1.0 / np.sqrt(float(max(1, symbol_count)))
 
         age_days = max(0.0, float((as_of - published_at.normalize()).days))
         if age_days > float(baseline_window_days):
@@ -597,7 +698,7 @@ def compute_news_event_metrics(
 
 
 def compute_news_theme_drift_metrics(
-    client: EODHDClient,
+    client: ClientLike,
     symbol: str,
     recent_window_days: int = 30,
     baseline_window_days: int = 90,
@@ -656,14 +757,33 @@ def compute_news_theme_drift_metrics(
         sentiment = article.get("sentiment") if isinstance(article.get("sentiment"), dict) else {}
         polarity = to_float(sentiment.get("polarity")) if isinstance(sentiment, dict) else None
         polarity = float(polarity) if polarity is not None else 0.0
-        category_bias = sum(float(category_specs[name]["bias"]) for name in categories)
+
+        # Use AV ticker-specific sentiment when available
+        av_ticker_sent, av_relevance, av_label_bias, has_av = _extract_av_article_sentiment(article)
+        if has_av and av_ticker_sent is not None:
+            polarity = av_ticker_sent
+
+        # Supplement keyword categories with AV topic tags
+        for cat in _av_topic_categories(article):
+            if cat not in categories and cat in category_specs:
+                categories.append(cat)
+
+        category_bias = sum(float(category_specs[name]["bias"]) for name in categories if name in category_specs)
         if categories:
             theme_score = float(np.clip((category_bias / max(1.5, float(len(categories)))) + 0.35 * polarity, -1.0, 1.0))
         else:
             theme_score = float(np.clip(0.35 * polarity, -1.0, 1.0))
 
-        symbol_count = len(article.get("symbols") or []) if isinstance(article.get("symbols"), list) else 1
-        relevance_weight = 1.0 / np.sqrt(float(max(1, symbol_count)))
+        # Boost theme score with AV label bias
+        if av_label_bias is not None:
+            theme_score = float(np.clip(theme_score + 0.10 * av_label_bias, -1.0, 1.0))
+
+        # Use AV relevance when available; fallback to 1/sqrt(symbol_count)
+        if has_av and av_relevance is not None and av_relevance > 0.0:
+            relevance_weight = float(np.clip(av_relevance, 0.05, 1.0))
+        else:
+            symbol_count = len(article.get("symbols") or []) if isinstance(article.get("symbols"), list) else 1
+            relevance_weight = 1.0 / np.sqrt(float(max(1, symbol_count)))
         if age_days <= float(recent_window_days):
             recent_scores.append(theme_score * relevance_weight)
         else:
@@ -714,11 +834,16 @@ def _insider_role_weight(item: Dict[str, Any], *, strict: bool = False) -> float
         return 2.0
     if "director" in blob or "officer" in blob or "president" in blob or "vp" in blob:
         return 1.0
+    # EDGAR boolean flags
+    if item.get("isOfficer"):
+        return 1.0
+    if item.get("isDirector"):
+        return 1.0
     return 0.5 if strict else 0.75
 
 
 def compute_insider_conviction_metrics(
-    client: EODHDClient,
+    client: ClientLike,
     symbol: str,
     lookback_days: int = 90,
     alpha_factor_spec: str = "legacy",
@@ -788,13 +913,13 @@ def compute_insider_conviction_metrics(
             or item.get("acquisitionOrDisposition")
             or ""
         ).upper()
-        is_buy = code in {"P", "A", "BUY", "ACQUIRE"}
-        is_sell = code in {"S", "D", "SELL", "DISPOSE"}
+        is_buy = code in {"P", "A", "BUY", "ACQUIRE", "GRANT"}
+        is_sell = code in {"S", "D", "SELL", "DISPOSE", "SALE"}
         if not is_buy and not is_sell:
             continue
         valid_trade_count += 1
 
-        shares = to_float(item.get("transactionAmount") or item.get("shares") or item.get("shareAmount"))
+        shares = to_float(item.get("transactionAmount") or item.get("transactionShares") or item.get("shares") or item.get("shareAmount"))
         price = to_float(item.get("transactionPrice") or item.get("price"))
         base_size = float(shares) if shares is not None else 1.0
         if price is not None and price > 0:
@@ -862,7 +987,7 @@ def compute_insider_conviction_metrics(
 
 
 def compute_pead_metrics_from_calendar(
-    client: EODHDClient,
+    client: ClientLike,
     symbol: Optional[str],
     lookback_days: int,
     half_life_days: int,
@@ -962,7 +1087,7 @@ def compute_pead_metrics_from_calendar(
 
 
 def compute_fundamental_metrics(
-    client: EODHDClient,
+    client: ClientLike,
     symbol: str,
     fundamentals: Dict[str, Any],
     dividend_source: str,
@@ -1622,7 +1747,142 @@ def compute_fundamental_metrics(
     return metrics
 
 
-def add_overlay_metrics(client: EODHDClient, row: Dict[str, Any], config: RankerConfig) -> Dict[str, Any]:
+def compute_technical_indicator_metrics(
+    client: ClientLike,
+    symbol: str,
+) -> Dict[str, Optional[float]]:
+    """Fetch AV technical indicators and distil them into a composite signal.
+
+    Returns a dict with:
+    - technical_rsi_14: raw RSI-14 value (0-100)
+    - technical_macd_histogram: latest MACD histogram value
+    - technical_bbands_pct_b: %B position within Bollinger Bands (0-1 normal)
+    - technical_adx_14: raw ADX-14 trend strength (0-100)
+    - technical_stoch_k: Stochastic %K
+    - technical_stoch_d: Stochastic %D
+    - technical_momentum_signal: composite signal in [-1, 1]
+    - technical_momentum_has_coverage: confidence scalar (0-1)
+    """
+    empty: Dict[str, Optional[float]] = {
+        "technical_rsi_14": None,
+        "technical_macd_histogram": None,
+        "technical_bbands_pct_b": None,
+        "technical_adx_14": None,
+        "technical_stoch_k": None,
+        "technical_stoch_d": None,
+        "technical_momentum_signal": None,
+        "technical_momentum_has_coverage": 0.0,
+        "technical_fetch_status": "empty",
+        "technical_fetch_error": 0.0,
+    }
+
+    if not hasattr(client, "get_rsi"):
+        return empty
+
+    components: list[float] = []
+    weights: list[float] = []
+
+    # --- RSI ---
+    try:
+        rsi_data = client.get_rsi(symbol)
+        rsi_series = rsi_data.get("Technical Analysis: RSI", {})
+        if rsi_series:
+            latest_date = sorted(rsi_series.keys(), reverse=True)[0]
+            rsi_val = float(rsi_series[latest_date].get("RSI", 50))
+            empty["technical_rsi_14"] = rsi_val
+            # RSI → signal: 50 is neutral, <30 oversold (bullish), >70 overbought (bearish)
+            rsi_signal = float(np.clip((50.0 - rsi_val) / 30.0, -1.0, 1.0))
+            components.append(rsi_signal)
+            weights.append(0.25)
+    except Exception:
+        pass
+
+    # --- MACD ---
+    try:
+        macd_data = client.get_macd(symbol)
+        macd_series = macd_data.get("Technical Analysis: MACD", {})
+        if macd_series:
+            latest_date = sorted(macd_series.keys(), reverse=True)[0]
+            hist_val = float(macd_series[latest_date].get("MACD_Hist", 0))
+            empty["technical_macd_histogram"] = hist_val
+            macd_signal = float(np.clip(hist_val / max(abs(hist_val) + 0.01, 0.5), -1.0, 1.0))
+            components.append(macd_signal)
+            weights.append(0.25)
+    except Exception:
+        pass
+
+    # --- Bollinger Bands ---
+    try:
+        bb_data = client.get_bbands(symbol)
+        bb_series = bb_data.get("Technical Analysis: BBANDS", {})
+        if bb_series:
+            latest_date = sorted(bb_series.keys(), reverse=True)[0]
+            upper = float(bb_series[latest_date].get("Real Upper Band", 0))
+            lower = float(bb_series[latest_date].get("Real Lower Band", 0))
+            middle = float(bb_series[latest_date].get("Real Middle Band", 0))
+            band_width = upper - lower
+            if band_width > 0 and middle > 0:
+                pct_b = (middle - lower) / band_width
+                empty["technical_bbands_pct_b"] = pct_b
+                # %B near 0 → oversold (bullish), near 1 → overbought (bearish)
+                bb_signal = float(np.clip((0.5 - pct_b) / 0.5, -1.0, 1.0))
+                components.append(bb_signal)
+                weights.append(0.15)
+    except Exception:
+        pass
+
+    # --- ADX ---
+    try:
+        adx_data = client.get_adx(symbol)
+        adx_series = adx_data.get("Technical Analysis: ADX", {})
+        if adx_series:
+            latest_date = sorted(adx_series.keys(), reverse=True)[0]
+            adx_val = float(adx_series[latest_date].get("ADX", 0))
+            empty["technical_adx_14"] = adx_val
+            # ADX is trend strength, not direction; used as confidence multiplier
+    except Exception:
+        pass
+
+    # --- Stochastic ---
+    try:
+        stoch_data = client.get_stoch(symbol)
+        stoch_series = stoch_data.get("Technical Analysis: STOCH", {})
+        if stoch_series:
+            latest_date = sorted(stoch_series.keys(), reverse=True)[0]
+            k_val = float(stoch_series[latest_date].get("SlowK", 50))
+            d_val = float(stoch_series[latest_date].get("SlowD", 50))
+            empty["technical_stoch_k"] = k_val
+            empty["technical_stoch_d"] = d_val
+            # Stochastic: <20 oversold (bullish), >80 overbought (bearish)
+            stoch_signal = float(np.clip((50.0 - k_val) / 40.0, -1.0, 1.0))
+            # K crossing above D is bullish
+            crossover_bonus = 0.15 if k_val > d_val else -0.10
+            stoch_signal = float(np.clip(stoch_signal + crossover_bonus, -1.0, 1.0))
+            components.append(stoch_signal)
+            weights.append(0.20)
+    except Exception:
+        pass
+
+    if not components:
+        return empty
+
+    # ADX-based trend confidence multiplier
+    adx = empty.get("technical_adx_14")
+    trend_confidence = float(np.clip((adx or 20.0) / 40.0, 0.3, 1.0))
+
+    total_weight = sum(weights)
+    composite = sum(c * w for c, w in zip(components, weights)) / total_weight
+    composite *= trend_confidence
+    composite = float(np.clip(composite, -1.0, 1.0))
+
+    coverage = float(np.clip(len(components) / 4.0, 0.0, 1.0))
+    empty["technical_momentum_signal"] = composite
+    empty["technical_momentum_has_coverage"] = coverage
+    empty["technical_fetch_status"] = "ok"
+    return empty
+
+
+def add_overlay_metrics(client: ClientLike, row: Dict[str, Any], config: RankerConfig) -> Dict[str, Any]:
     out = dict(row)
     symbol = str(row.get("analysis_symbol") or row.get("symbol") or "")
 
@@ -1728,6 +1988,17 @@ def add_overlay_metrics(client: EODHDClient, row: Dict[str, Any], config: Ranker
                 short_interest_change=to_float(out.get("short_interest_change")),
             )
         )
+        # Enrich with SEC EDGAR insider summary when available via DataProvider
+        if hasattr(client, "get_edgar_insider_summary"):
+            try:
+                edgar_summary = client.get_edgar_insider_summary(symbol)
+                if edgar_summary:
+                    out["edgar_insider_buy_count"] = to_float(edgar_summary.get("buy_count"))
+                    out["edgar_insider_sell_count"] = to_float(edgar_summary.get("sell_count"))
+                    out["edgar_insider_net_value"] = to_float(edgar_summary.get("net_value"))
+                    out["edgar_insider_cluster_detected"] = float(edgar_summary.get("cluster_detected", False))
+            except Exception:
+                pass
     else:
         out.setdefault("insider_conviction_signal", None)
         out.setdefault("insider_conviction_has_coverage", 0.0)
@@ -1741,6 +2012,20 @@ def add_overlay_metrics(client: EODHDClient, row: Dict[str, Any], config: Ranker
         out.setdefault("insider_fetch_status", "not_requested")
         out.setdefault("insider_fetch_error", 0.0)
         out.setdefault("insider_fetch_error_type", None)
+
+    if getattr(config, "use_technical_momentum", False):
+        out.update(compute_technical_indicator_metrics(client, symbol))
+    else:
+        out.setdefault("technical_rsi_14", None)
+        out.setdefault("technical_macd_histogram", None)
+        out.setdefault("technical_bbands_pct_b", None)
+        out.setdefault("technical_adx_14", None)
+        out.setdefault("technical_stoch_k", None)
+        out.setdefault("technical_stoch_d", None)
+        out.setdefault("technical_momentum_signal", None)
+        out.setdefault("technical_momentum_has_coverage", 0.0)
+        out.setdefault("technical_fetch_status", "not_requested")
+        out.setdefault("technical_fetch_error", 0.0)
 
     out["sentiment_filter_pass"] = 1.0
     if config.use_sentiment:

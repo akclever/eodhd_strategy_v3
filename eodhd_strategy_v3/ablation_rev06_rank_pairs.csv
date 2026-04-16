@@ -1,4 +1,0 @@
-baseline,scenario,top_n,top_n_overlap_count,top_n_overlap_ratio,rank_spearman_corr,mean_abs_rank_shift,max_abs_rank_shift
-baseline,lifecycle,25,25,1.0,0.9932773109243698,0.8235294117647058,3.0
-baseline,growth,25,25,1.0,0.9850267379679144,1.2941176470588236,4.0
-baseline,growth_trend,25,25,1.0,0.9495798319327731,2.5294117647058822,6.0

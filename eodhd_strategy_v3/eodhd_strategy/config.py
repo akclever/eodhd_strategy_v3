@@ -80,6 +80,9 @@ class RankerConfig:
     universe_size: int
     use_employee_efficiency: bool
     employee_efficiency_weight: float
+    data_provider: Literal["eodhd", "alpha_vantage", "hybrid", "fmp"] = "eodhd"
+    alpha_vantage_api_key: str = ""
+    sec_edgar_email: str = ""
     analysis_from_primary_ticker: bool = False
     exclude_special_situations: bool = False
     price_momentum_source_mode: Literal["auto", "history_only", "trend_proxy"] = "auto"
@@ -94,6 +97,36 @@ class RankerConfig:
     revision_jerk_weight: float = 0.04
     use_news_shock: bool = False
     news_shock_weight: float = 0.04
+    use_technical_momentum: bool = False
+    technical_momentum_weight: float = 0.05
+
+    # --- Extracted structural thresholds (formerly magic numbers) ---
+    shareholder_yield_range: tuple[float, float] = (-0.25, 0.25)
+    buyback_yield_range: tuple[float, float] = (-0.20, 0.20)
+    gross_profitability_range: tuple[float, float] = (0.0, 2.0)
+    adjusted_book_to_market_range: tuple[float, float] = (0.0, 3.0)
+    recency_ratio_range: tuple[float, float] = (0.50, 1.20)
+    price_to_200dma_range: tuple[float, float] = (0.50, 2.50)
+    zscore_clip: float = 2.0
+    trend_penalty_slope: float = 2.5
+    trend_penalty_cap: float = 1.0
+    quality_penalty_cap: float = 0.5
+    forensic_missing_penalty: float = 0.15
+    core_impute_penalty: float = 0.05
+    core_missing_penalty: float = 0.15
+    momentum_missing_penalty: float = 0.10
+    max_combined_news_share: float = 0.04
+    earnings_momentum_base_weight: float = 0.08
+    revision_jerk_persistence_min_days: int = 14
+    life_cycle_min_confidence: float = 0.15
+    huber_min_samples: int = 16
+    residual_min_usable: int = 12
+    peer_anomaly_min_inputs: int = 2
+    peer_anomaly_min_group: int = 12
+    growth_component_yoy_share: float = 0.45
+    growth_component_accel_share: float = 0.55
+    use_dynamic_weights: bool = True
+    dynamic_weight_min_universe: int = 30
 
 
 @dataclass
