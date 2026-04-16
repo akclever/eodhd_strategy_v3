@@ -36,10 +36,10 @@ async def test_endpoint(client, endpoint_name, fetch_func, *args, **kwargs):
         result = await fetch_func(*args, **kwargs)
         
         if result.empty:
-            print(f"❌ {endpoint_name}: No data returned")
+            print(f"[FAILED] {endpoint_name}: No data returned")
             return False
         
-        print(f"✓ {endpoint_name}: {len(result)} records")
+        print(f"[OK] {endpoint_name}: {len(result)} records")
         print(f"  Columns: {list(result.columns)}")
         print(f"  Sample data:")
         print(result.head(2).to_string())
@@ -47,7 +47,7 @@ async def test_endpoint(client, endpoint_name, fetch_func, *args, **kwargs):
         return True
         
     except Exception as e:
-        print(f"❌ {endpoint_name}: Error - {e}")
+        print(f"[FAILED] {endpoint_name}: Error - {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -160,16 +160,16 @@ async def main(args):
         total = len(results)
         
         for endpoint, success in results.items():
-            status = "✓" if success else "❌"
+            status = "[OK]" if success else "[FAILED]"
             print(f"{status} {endpoint}")
         
         print(f"\nPassed: {passed}/{total}")
         
         if passed == total:
-            print("\n✓ All endpoints working! Ready to run full ranker.")
+            print("\n[OK] All endpoints working! Ready to run full ranker.")
             return 0
         else:
-            print("\n⚠ Some endpoints failed. Check errors above and adjust fmp_mapper.py if needed.")
+            print("\n[WARN] Some endpoints failed. Check errors above and adjust fmp_mapper.py if needed.")
             return 1
 
 

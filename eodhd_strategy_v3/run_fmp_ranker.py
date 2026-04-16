@@ -274,43 +274,99 @@ async def run_fmp_ranker(args):
     # Fetch all bulk data from FMP
     async with FMPClient(fmp_config) as client:
         logger.info("Fetching bulk data from FMP Ultimate API...")
-        bulk_data = await client.fetch_all_bulk_data(
-            market=args.market,
-            financial_period=args.financial_period,
-            symbols=None  # Will fetch per-ticker data after getting symbols from profiles
+        
+        # Step 1: Get universe from screener
+        logger.info("Step 1: Fetching universe from screener...")
+        screener_df = await client.fetch_screener(
+            is_actively_trading=True,
+            market_cap_more_than=args.min_market_cap,
+            limit=5000,
         )
+        logger.info(f"  Screener returned {len(screener_df)} symbols")
+        
+        if screener_df.empty or "symbol" not in screener_df.columns:
+            logger.error("Screener returned no data. Cannot proceed.")
+            sys.exit(1)
+        
+        # Use screener as profiles (it has symbol, market_cap, sector, industry, etc.)
+        bulk_data = {
+            "profiles": screener_df,
+        }
+        
+        # Limit symbols for per-ticker endpoints to avoid rate limits
+        # Sort by market cap descending to prioritize largest companies
+        if "market_cap" in screener_df.columns:
+            screener_sorted = screener_df.sort_values("market_cap", ascending=False)
+        else:
+            screener_sorted = screener_df
+        symbols = screener_sorted["symbol"].tolist()[:500]
+        logger.info(f"  Using top {len(symbols)} symbols for per-ticker data")
+        
+        # Step 2: Fetch per-ticker financial statements
+        logger.info("Step 2: Fetching financial statements...")
+        bulk_data["income_statements"] = await client.fetch_income_statement_bulk(
+            symbols=symbols, period=args.financial_period
+        )
+        logger.info(f"  Income statements: {len(bulk_data['income_statements'])} records")
+        
+        bulk_data["balance_sheets"] = await client.fetch_balance_sheet_bulk(
+            symbols=symbols, period=args.financial_period
+        )
+        logger.info(f"  Balance sheets: {len(bulk_data['balance_sheets'])} records")
+        
+        bulk_data["cash_flows"] = await client.fetch_cash_flow_bulk(
+            symbols=symbols, period=args.financial_period
+        )
+        logger.info(f"  Cash flows: {len(bulk_data['cash_flows'])} records")
+        
+        # Step 3: Fetch prices
+        logger.info("Step 3: Fetching prices...")
+        bulk_data["prices"] = await client.fetch_bulk_daily_prices(symbols=symbols)
+        logger.info(f"  Prices: {len(bulk_data['prices'])} records")
+        
+        # Step 4: Fetch analyst estimates (now with historical time series)
+        logger.info("Step 4: Fetching analyst estimates (current + historical)...")
+        bulk_data["analyst_estimates"] = await client.fetch_analyst_estimates_bulk(
+            symbols=symbols, period=args.financial_period, historical_limit=20
+        )
+        logger.info(f"  Analyst estimates: {len(bulk_data['analyst_estimates'])} records")
+        
+        # Step 5: Fetch Earnings Surprises (BULK)
+        # Fetch current and previous year to ensure we have context
+        logger.info("Step 5: Fetching bulk earnings surprises (2025-2026)...")
+        surprises_2026 = await client.fetch_earnings_surprises_bulk(year=2026)
+        surprises_2025 = await client.fetch_earnings_surprises_bulk(year=2025)
+        bulk_data["earnings_surprises"] = pd.concat([surprises_2026, surprises_2025]).drop_duplicates()
+        logger.info(f"  Earnings surprises: {len(bulk_data['earnings_surprises'])} records")
+        
+        # Step 6: Fetch insider trading (bulk, not per-symbol)
+        logger.info("Step 6: Fetching insider trading...")
+        bulk_data["insider_trading"] = await client.fetch_insider_trading_bulk(page=0, limit=500)
+        logger.info(f"  Insider trading: {len(bulk_data['insider_trading'])} records")
+        
+        # Step 7: Institutional ownership (currently unavailable on FMP stable API)
+        logger.info("Step 7: Institutional ownership (degraded - endpoint unavailable)")
+        bulk_data["institutional_ownership"] = pd.DataFrame()
         
         logger.info("Bulk data fetch completed")
-        for data_type, df in bulk_data.items():
-            logger.info(f"  {data_type}: {len(df)} records")
-        
-        # If we have profiles, extract symbols for per-ticker endpoints
-        symbols = None
-        if not bulk_data.get("profiles", pd.DataFrame()).empty:
-            symbols = bulk_data["profiles"]["symbol"].tolist()
-            logger.info(f"Extracted {len(symbols)} symbols from profiles for per-ticker endpoints")
-            
-            # Fetch per-ticker data
-            logger.info("Fetching per-ticker data (estimates, institutional)...")
-            ticker_data = await client.fetch_all_bulk_data(
-                market=args.market,
-                financial_period=args.financial_period,
-                symbols=symbols[:500]  # Limit to 500 for now to avoid rate limits
-            )
-            
-            # Merge ticker data
-            for key, df in ticker_data.items():
-                if not df.empty:
-                    bulk_data[key] = df
-                    logger.info(f"  {key}: {len(df)} records")
+
     
+    # Enable PEAD and Revision Jerk in the ranker config now that we have the data
+    ranker_config.use_pead = not bulk_data["earnings_surprises"].empty
+    ranker_config.use_revision_jerk = not bulk_data["analyst_estimates"].empty
+    if ranker_config.use_pead:
+        logger.info("  ✓ PEAD signal enabled")
+    if ranker_config.use_revision_jerk:
+        logger.info("  ✓ Analyst Revision Jerk enabled")
+
     # Map FMP data to ranker-expected format
     logger.info("Mapping FMP data to ranker format...")
     raw_df = create_raw_fmp_dataframe(
         bulk_data=bulk_data,
         market=args.market,
         financial_period=args.financial_period,
-        historical_estimates_df=None
+        historical_estimates_df=bulk_data["analyst_estimates"],
+        surprises_df=bulk_data["earnings_surprises"]
     )
     
     logger.info(f"Raw DataFrame: {len(raw_df)} symbols, {len(raw_df.columns)} columns")
@@ -321,24 +377,35 @@ async def run_fmp_ranker(args):
     
     # Run the ranker
     logger.info("Running ranker...")
-    ranked_df, error_df, median_df = build_ranked_frame(raw_df, ranker_config)
+    full_df, ranked_df, diagnostic_df = build_ranked_frame(raw_df, ranker_config)
     
     logger.info(f"Ranking completed: {len(ranked_df)} symbols ranked")
     
-    # Print error summary
-    if not error_df.empty:
-        print_error_summary(error_df)
+    # Filter for real errors in diagnostic_df (if any)
+    if not diagnostic_df.empty and "error" in diagnostic_df.columns:
+        real_errors = diagnostic_df[diagnostic_df["error"].notna() & (diagnostic_df["error"] != "")]
+        if not real_errors.empty:
+            print_error_summary(real_errors)
     
     # Save output
     output_path = Path(args.output)
+    
+    # Reorder columns to move composite_score and rank to the front
+    cols = ranked_df.columns.tolist()
+    front_cols = ["symbol", "composite_score", "rank"]
+    actual_front = [c for c in front_cols if c in cols]
+    remaining = [c for c in cols if c not in actual_front]
+    ranked_df = ranked_df[actual_front + remaining]
+    
+    # Use ranked_df as the primary output
     ranked_df.to_csv(output_path, index=False)
     logger.info(f"Ranked stocks saved to {output_path}")
     
-    # Save median comparison if available
-    if not median_df.empty:
-        median_path = output_path.parent / f"{output_path.stem}_medians.csv"
-        median_df.to_csv(median_path, index=False)
-        logger.info(f"Median comparison saved to {median_path}")
+    # Save diagnostic comparison if available
+    if not diagnostic_df.empty:
+        diag_path = output_path.parent / f"{output_path.stem}_diagnostics.csv"
+        diagnostic_df.to_csv(diag_path, index=False)
+        logger.info(f"Diagnostics saved to {diag_path}")
     
     # Verification checks
     if args.verify:
@@ -347,7 +414,7 @@ async def run_fmp_ranker(args):
     
     logger.info("FMP ranker execution completed successfully")
     
-    return ranked_df, error_df, median_df
+    return ranked_df, diagnostic_df, pd.DataFrame()
 
 
 def verify_ranking(ranked_df: pd.DataFrame, raw_df: pd.DataFrame):

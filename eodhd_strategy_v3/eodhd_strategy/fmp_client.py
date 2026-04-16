@@ -76,10 +76,26 @@ class FMPClient:
         try:
             async with self._session.get(url, params=params) as response:
                 if response.status == 200:
-                    data = await response.json()
-                    if isinstance(data, dict):
-                        return data.get("data", [])
-                    return data if isinstance(data, list) else [data]
+                    text = await response.text()
+                    if text.startswith("symbol,") or text.startswith('"symbol",') or text.startswith('symbol\r') or text.startswith('symbol\n'):
+                        import io
+                        import pandas as pd
+                        try:
+                            df = pd.read_csv(io.StringIO(text))
+                            return df.to_dict(orient="records")
+                        except Exception as e:
+                            print(f"Error parsing CSV from {url}: {e}")
+                            return []
+                    else:
+                        import json
+                        try:
+                            data = json.loads(text)
+                            if isinstance(data, dict):
+                                return data.get("data", [])
+                            return data if isinstance(data, list) else [data]
+                        except Exception as e:
+                            print(f"Error parsing JSON from {url}: {e}")
+                            return []
                 
                 # Graceful Degradation: Do not crash if tier limits or missing endpoints are hit
                 if response.status in [400, 401, 403, 404]:
@@ -178,9 +194,9 @@ class FMPClient:
         if country:
             params["country"] = country
         if is_etf is not None:
-            params["isEtf"] = is_etf
+            params["isEtf"] = str(is_etf).lower()
         if is_actively_trading is not None:
-            params["isActivelyTrading"] = is_actively_trading
+            params["isActivelyTrading"] = str(is_actively_trading).lower()
         
         data = await self._get(endpoint, params)
         if not data:
@@ -247,13 +263,12 @@ class FMPClient:
         df = pd.DataFrame(all_data)
         available_mapping = {k: v for k, v in {
             "symbol": "symbol", "date": "date", "period": "period",
-            "revenue": "total_revenue", "totalRevenue": "total_revenue",
-            "costOfRevenue": "cost_of_revenue",
-            "grossProfit": "gross_profit", 
-            "researchAndDevelopmentExpenses": "rd_expenses",
-            "sellingGeneralAndAdministrativeExpenses": "sga_expenses",
+            "revenue": "revenue", "costOfRevenue": "cost_of_revenue",
+            "grossProfit": "gross_profit", "grossProfitRatio": "gross_margin",
+            "researchAndDevelopmentExpenses": "rd_expense",
             "operatingExpenses": "operating_expenses", "operatingIncome": "operating_income",
-            "netIncome": "net_income", "ebitda": "ebitda", "eps": "eps"
+            "netIncome": "net_income", "eps": "eps", "epsDiluted": "eps_diluted",
+            "weightedAverageShsOut": "shares_outstanding",
         }.items() if k in df.columns}
         
         df = df.rename(columns=available_mapping)
@@ -286,12 +301,10 @@ class FMPClient:
         available_mapping = {k: v for k, v in {
             "symbol": "symbol", "date": "date", "period": "period",
             "totalAssets": "total_assets", "totalLiabilities": "total_liabilities",
-            "totalStockholdersEquity": "shareholders_equity", 
             "totalStockholdersEquity": "total_stockholders_equity",
-            "commonStockSharesOutstanding": "shares_outstanding",
             "netReceivables": "net_receivables", "inventory": "inventory",
             "accountPayables": "account_payables", "cashAndCashEquivalents": "cash_and_equivalents",
-            "intangibleAssets": "intangible_assets", "goodWill": "goodwill",
+            "intangibleAssets": "intangible_assets", "goodwill": "goodwill",
         }.items() if k in df.columns}
         
         df = df.rename(columns=available_mapping)
@@ -325,8 +338,10 @@ class FMPClient:
             "symbol": "symbol", "date": "date", "period": "period",
             "netCashProvidedByOperatingActivities": "operating_cash_flow",
             "operatingCashFlow": "operating_cash_flow", "capitalExpenditure": "capital_expenditure",
-            "freeCashFlow": "free_cash_flow", "dividendsPaid": "dividends_paid",
-            "commonStockIssued": "stock_issued", "commonStockRepurchased": "stock_repurchased",
+            "freeCashFlow": "free_cash_flow", 
+            "commonDividendsPaid": "dividends_paid", "netDividendsPaid": "dividends_paid",
+            "commonStockIssued": "stock_issued", "netCommonStockIssuance": "stock_issued",
+            "commonStockRepurchased": "stock_repurchased",
         }.items() if k in df.columns}
         
         df = df.rename(columns=available_mapping)
@@ -335,7 +350,7 @@ class FMPClient:
         return df
     
     async def fetch_analyst_estimates_bulk(
-        self, symbols: list[str] = None, period: str = "annual", limit: int = 100
+        self, symbols: list[str] = None, period: str = "annual", limit: int = 100, historical_limit: int = 10
     ) -> pd.DataFrame:
         """Fetch analyst estimates per-symbol using /stable/analyst-estimates."""
         if not symbols:
@@ -344,7 +359,7 @@ class FMPClient:
         all_data = []
         for symbol in symbols[:limit]:
             endpoint = "analyst-estimates"
-            params = {"symbol": symbol, "period": period, "page": 0, "limit": 10}
+            params = {"symbol": symbol, "period": period, "page": 0, "limit": historical_limit}
             data = await self._get(endpoint, params)
             if data:
                 for record in data:
@@ -352,7 +367,44 @@ class FMPClient:
                         record["symbol"] = symbol
                 all_data.extend(data)
                 
-        return pd.DataFrame(all_data)
+        if not all_data:
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(all_data)
+        available_mapping = {k: v for k, v in {
+            "symbol": "symbol", "date": "date",
+            "estimatedEpsAvg": "estimated_eps", "estimatedEpsHigh": "estimated_eps_high",
+            "estimatedEpsLow": "estimated_eps_low", "numberAnalystEstimatedEps": "analyst_count",
+            "estimatedRevenueAvg": "estimated_revenue",
+        }.items() if k in df.columns}
+        
+        df = df.rename(columns=available_mapping)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    async def fetch_earnings_surprises_bulk(
+        self, year: int = 2026
+    ) -> pd.DataFrame:
+        """Fetch bulk earnings surprises using /stable/earnings-surprises-bulk."""
+        endpoint = "earnings-surprises-bulk"
+        params = {"year": year}
+        data = await self._get(endpoint, params)
+        if not data:
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(data)
+        available_mapping = {k: v for k, v in {
+            "symbol": "symbol", "date": "date", 
+            "actualEps": "actual_eps", "epsActual": "actual_eps",
+            "estimatedEps": "estimated_eps", "epsEstimated": "estimated_eps",
+            "surprisePercent": "surprise_percent",
+        }.items() if k in df.columns}
+        
+        df = df.rename(columns=available_mapping)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+        return df
 
     async def fetch_institutional_ownership_bulk(
         self, symbols: list[str] = None, year: int = None, quarter: int = None

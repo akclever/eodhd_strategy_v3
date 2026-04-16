@@ -128,6 +128,17 @@ def map_financial_statements(
     balance_latest = get_latest_records(balance_df)
     cashflow_latest = get_latest_records(cashflow_df)
     
+    # Helper to safely get column as Series (handles duplicate column names)
+    def safe_get_column(df: pd.DataFrame, col: str) -> pd.Series:
+        """Extract column as Series, handling duplicate column names."""
+        if col not in df.columns:
+            return pd.Series([np.nan] * len(df), index=df.index)
+        result = df[col]
+        if isinstance(result, pd.DataFrame):
+            # Duplicate column names - take the first one
+            result = result.iloc[:, 0]
+        return result
+    
     # Start with income statement
     if not income_latest.empty:
         df = income_latest.copy()
@@ -143,9 +154,13 @@ def map_financial_statements(
     if not cashflow_latest.empty:
         df = df.merge(cashflow_latest, on="symbol", how="outer", suffixes=("", "_cashflow"))
     
-    # Merge profiles for market cap
+    # Merge profiles for market cap AND dividend data
+    profile_cols = ["symbol", "market_cap"]
+    for col in ["lastAnnualDividend", "lastDividend", "price"]:
+        if not profiles_df.empty and col in profiles_df.columns:
+            profile_cols.append(col)
     if not profiles_df.empty:
-        df = df.merge(profiles_df[["symbol", "market_cap"]], on="symbol", how="left")
+        df = df.merge(profiles_df[list(dict.fromkeys(profile_cols))], on="symbol", how="left")
     
     # Initialize output columns with NaN
     output = pd.DataFrame(index=df.index)
@@ -164,8 +179,9 @@ def map_financial_statements(
     }
     
     for fmp_col, ranker_col in income_mapping.items():
-        if fmp_col in df.columns:
-            output[ranker_col] = pd.to_numeric(df[fmp_col], errors="coerce")
+        col_data = safe_get_column(df, fmp_col)
+        if col_data.notna().any():
+            output[ranker_col] = pd.to_numeric(col_data, errors="coerce")
         else:
             output[ranker_col] = np.nan
     
@@ -185,8 +201,9 @@ def map_financial_statements(
     }
     
     for fmp_col, ranker_col in balance_mapping.items():
-        if fmp_col in df.columns:
-            output[ranker_col] = pd.to_numeric(df[fmp_col], errors="coerce")
+        col_data = safe_get_column(df, fmp_col)
+        if col_data.notna().any():
+            output[ranker_col] = pd.to_numeric(col_data, errors="coerce")
         else:
             output[ranker_col] = np.nan
     
@@ -201,14 +218,16 @@ def map_financial_statements(
     }
     
     for fmp_col, ranker_col in cashflow_mapping.items():
-        if fmp_col in df.columns:
-            output[ranker_col] = pd.to_numeric(df[fmp_col], errors="coerce")
+        col_data = safe_get_column(df, fmp_col)
+        if col_data.notna().any():
+            output[ranker_col] = pd.to_numeric(col_data, errors="coerce")
         else:
             output[ranker_col] = np.nan
     
     # Ensure market_cap is available
-    if "market_cap" in df.columns:
-        output["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
+    market_cap_col = safe_get_column(df, "market_cap")
+    if market_cap_col.notna().any():
+        output["market_cap"] = pd.to_numeric(market_cap_col, errors="coerce")
     else:
         output["market_cap"] = np.nan
     
@@ -240,10 +259,21 @@ def map_financial_statements(
         default=np.nan
     )
     
-    # dividend_yield (will be computed from dividends data, placeholder for now)
-    output["dividend_yield"] = np.nan
-    
-    # buyback_yield = stock_repurchased / market_cap
+    # dividend_yield = lastAnnualDividend / price  (from screener/profile data)
+    # Try both column name variants that FMP returns
+    last_div = safe_get_column(df, "lastAnnualDividend").fillna(
+        safe_get_column(df, "lastDividend")
+    )
+    price_for_yield = safe_get_column(df, "price").replace(0, np.nan)
+    computed_div_yield = _safe_divide(
+        pd.to_numeric(last_div, errors="coerce"),
+        pd.to_numeric(price_for_yield, errors="coerce"),
+        default=np.nan,
+    )
+    output["dividend_yield"] = computed_div_yield
+    output["safe_dividend_yield"] = computed_div_yield  # simplified — no payout safety gate yet
+
+    # buyback_yield = |stock_repurchased| / market_cap
     # Note: stock_repurchased is typically negative in FMP data
     stock_repurchased_abs = output["stock_repurchased"].abs()
     output["buyback_yield"] = _safe_divide(
@@ -251,10 +281,12 @@ def map_financial_statements(
         output["market_cap"],
         default=0.0
     )
-    
+
     # shareholder_yield = dividend_yield + buyback_yield
-    # If either component is missing, result should be NaN
-    output["shareholder_yield"] = output["dividend_yield"] + output["buyback_yield"]
+    # Use fillna(0) so a missing component doesn't blank the whole yield
+    output["shareholder_yield"] = (
+        output["dividend_yield"].fillna(0.0) + output["buyback_yield"].fillna(0.0)
+    ).where(output["dividend_yield"].notna() | output["buyback_yield"].notna(), other=np.nan)
     
     # payout_ratio = dividends_paid / net_income
     output["payout_ratio"] = _safe_divide(
@@ -320,7 +352,7 @@ def map_financial_statements(
     
     # Determine which adjusted values to use
     output["intangible_adjustment_applied"] = (
-        output["intangible_adjustment_eligible"] & 
+        (output["intangible_adjustment_eligible"].fillna(0).astype(bool)) & 
         (output["intangible_adjusted_gross_profitability"].notna() | 
          output["intangible_adjusted_book_to_market"].notna())
     ).astype(float)
@@ -417,9 +449,28 @@ def map_beneish_components(
     for comp in beneish_components:
         output[comp] = np.nan
     
+    def _safe_col(df: pd.DataFrame, col: str, suffix: str = "") -> pd.Series:
+        """Try multiple candidate column names (handles _cashflow/_balance rename suffixes).
+        Returns a numeric Series of NaN if none found."""
+        candidates = [
+            f"{col}{suffix}",
+            f"{col}_cashflow{suffix}",
+            f"{col}_balance{suffix}",
+        ]
+        # Also try without the period suffix in case the join collapsed it
+        if suffix:
+            candidates += [f"{col}_cashflow", f"{col}_balance", col]
+        for name in candidates:
+            if name in df.columns:
+                val = df[name]
+                if isinstance(val, pd.DataFrame):
+                    val = val.iloc[:, 0]
+                return pd.to_numeric(val, errors="coerce")
+        return pd.Series(np.nan, index=df.index, dtype=float)
+
     # Compute components if both periods are available
     if not prior.empty:
-        # Merge current and prior
+        # Merge current and prior with clear suffixes
         merged = current.merge(
             prior,
             on="symbol",
@@ -427,104 +478,84 @@ def map_beneish_components(
             suffixes=("_current", "_prior")
         )
         
+        def mc(col): return _safe_col(merged, col, "_current")
+        def mp(col): return _safe_col(merged, col, "_prior")
+
         # DSRI: Days Sales in Receivables Index
-        # (Receivables_current / Sales_current) / (Receivables_prior / Sales_prior)
-        receivables_current = pd.to_numeric(merged["net_receivables_current"], errors="coerce")
-        receivables_prior = pd.to_numeric(merged["net_receivables_prior"], errors="coerce")
-        sales_current = pd.to_numeric(merged["total_revenue_current"], errors="coerce")
-        sales_prior = pd.to_numeric(merged["total_revenue_prior"], errors="coerce")
-        
+        receivables_current = mc("net_receivables")
+        receivables_prior   = mp("net_receivables")
+        sales_current       = mc("total_revenue")
+        sales_prior         = mp("total_revenue")
         dsr_current = _safe_divide(receivables_current, sales_current, default=np.nan)
-        dsr_prior = _safe_divide(receivables_prior, sales_prior, default=np.nan)
+        dsr_prior   = _safe_divide(receivables_prior,   sales_prior,   default=np.nan)
         output["dsri"] = _safe_divide(dsr_current, dsr_prior, default=np.nan)
         
         # GMI: Gross Margin Index
-        # Gross Margin_prior / Gross Margin_current
-        gross_profit_current = pd.to_numeric(merged["gross_profit_current"], errors="coerce")
-        gross_profit_prior = pd.to_numeric(merged["gross_profit_prior"], errors="coerce")
-        
+        gross_profit_current = mc("gross_profit")
+        gross_profit_prior   = mp("gross_profit")
         gm_current = _safe_divide(gross_profit_current, sales_current, default=np.nan)
-        gm_prior = _safe_divide(gross_profit_prior, sales_prior, default=np.nan)
+        gm_prior   = _safe_divide(gross_profit_prior,   sales_prior,   default=np.nan)
         output["gmi"] = _safe_divide(gm_prior, gm_current, default=np.nan)
         
         # SGI: Sales Growth Index
-        # Sales_current / Sales_prior
         output["sgi"] = _safe_divide(sales_current, sales_prior, default=np.nan)
         
-        # DEPI: Depreciation Index
-        # (Depreciation_prior / (PP&E_prior + Depreciation_prior)) / 
-        # (Depreciation_current / (PP&E_current + Depreciation_current))
-        # Note: FMP doesn't provide depreciation directly, use capital expenditure as proxy
-        capex_current = pd.to_numeric(merged["capital_expenditure_current"], errors="coerce").abs()
-        capex_prior = pd.to_numeric(merged["capital_expenditure_prior"], errors="coerce").abs()
-        ppe_current = pd.to_numeric(merged["total_assets_current"], errors="coerce")  # Proxy
-        ppe_prior = pd.to_numeric(merged["total_assets_prior"], errors="coerce")
-        
+        # DEPI: Depreciation Index (proxy via capex / (assets + capex))
+        capex_current = mc("capital_expenditure").abs()
+        capex_prior   = mp("capital_expenditure").abs()
+        ppe_current   = mc("total_assets")
+        ppe_prior     = mp("total_assets")
         depi_current = _safe_divide(capex_current, ppe_current + capex_current, default=np.nan)
-        depi_prior = _safe_divide(capex_prior, ppe_prior + capex_prior, default=np.nan)
+        depi_prior   = _safe_divide(capex_prior,   ppe_prior   + capex_prior,   default=np.nan)
         output["depi"] = _safe_divide(depi_prior, depi_current, default=np.nan)
         
         # SGAI: SG&A Index
-        # (SG&A_current / Sales_current) / (SG&A_prior / Sales_prior)
-        sga_current = pd.to_numeric(merged["sga_expenses_current"], errors="coerce")
-        sga_prior = pd.to_numeric(merged["sga_expenses_prior"], errors="coerce")
-        
+        sga_current       = mc("sga_expenses")
+        sga_prior         = mp("sga_expenses")
         sga_ratio_current = _safe_divide(sga_current, sales_current, default=np.nan)
-        sga_ratio_prior = _safe_divide(sga_prior, sales_prior, default=np.nan)
+        sga_ratio_prior   = _safe_divide(sga_prior,   sales_prior,   default=np.nan)
         output["sgai"] = _safe_divide(sga_ratio_current, sga_ratio_prior, default=np.nan)
         
         # LVGI: Leverage Index
-        # ((LTD_current + Current Liabilities_current) / Total Assets_current) /
-        # ((LTD_prior + Current Liabilities_prior) / Total Assets_prior)
-        # Simplified: Total Liabilities / Total Assets
-        liabilities_current = pd.to_numeric(merged["total_liabilities_current"], errors="coerce")
-        liabilities_prior = pd.to_numeric(merged["total_liabilities_prior"], errors="coerce")
-        assets_current = pd.to_numeric(merged["total_assets_current"], errors="coerce")
-        assets_prior = pd.to_numeric(merged["total_assets_prior"], errors="coerce")
-        
+        liabilities_current = mc("total_liabilities")
+        liabilities_prior   = mp("total_liabilities")
+        assets_current      = mc("total_assets")
+        assets_prior        = mp("total_assets")
         leverage_current = _safe_divide(liabilities_current, assets_current, default=np.nan)
-        leverage_prior = _safe_divide(liabilities_prior, assets_prior, default=np.nan)
+        leverage_prior   = _safe_divide(liabilities_prior,   assets_prior,   default=np.nan)
         output["lvgi"] = _safe_divide(leverage_current, leverage_prior, default=np.nan)
         
         # TATA: Total Accruals to Total Assets
-        # (Income from Continuing Operations - Cash Flows from Operations) / Total Assets
-        cfo_current = pd.to_numeric(merged["operating_cash_flow_current"], errors="coerce")
-        income_current = pd.to_numeric(merged["net_income_current"], errors="coerce")
-        
+        cfo_current    = mc("operating_cash_flow")
+        income_current = mc("net_income")
         accruals = income_current - cfo_current
         output["tata"] = _safe_divide(accruals, assets_current, default=np.nan)
         
         # AQI: Asset Quality Index
-        # (1 - ((Current Assets + PP&E) / Total Assets))_current /
-        # (1 - ((Current Assets + PP&E) / Total Assets))_prior
-        # Simplified: (1 - (Cash + Receivables + Inventory) / Total Assets)
-        cash_current = pd.to_numeric(merged["cash_and_equivalents_current"], errors="coerce")
-        cash_prior = pd.to_numeric(merged["cash_and_equivalents_prior"], errors="coerce")
-        inventory_current = pd.to_numeric(merged["inventory_current"], errors="coerce")
-        inventory_prior = pd.to_numeric(merged["inventory_prior"], errors="coerce")
-        
-        current_assets_proxy = cash_current + receivables_current + inventory_current
-        current_assets_proxy_prior = cash_prior + receivables_prior + inventory_prior
-        
-        asset_quality_current = 1 - _safe_divide(current_assets_proxy, assets_current, default=np.nan)
-        asset_quality_prior = 1 - _safe_divide(current_assets_proxy_prior, assets_prior, default=np.nan)
+        cash_current      = mc("cash_and_equivalents")
+        cash_prior        = mp("cash_and_equivalents")
+        inventory_current = mc("inventory")
+        inventory_prior   = mp("inventory")
+        current_assets_proxy       = cash_current + receivables_current + inventory_current
+        current_assets_proxy_prior = cash_prior   + receivables_prior   + inventory_prior
+        asset_quality_current = 1 - _safe_divide(current_assets_proxy,       assets_current, default=np.nan)
+        asset_quality_prior   = 1 - _safe_divide(current_assets_proxy_prior, assets_prior,   default=np.nan)
         output["aqi"] = _safe_divide(asset_quality_current, asset_quality_prior, default=np.nan)
     
-    # Compute Beneish M-Score
+    # Beneish M-Score
     # M = -4.84 + 0.92*DSRI + 0.528*GMI + 0.404*AQI + 0.892*SGI + 0.115*DEPI - 0.172*SGAI + 4.679*TATA - 0.327*LVGI
     output["beneish_m_score"] = (
-        -4.84 +
-        0.92 * output["dsri"] +
-        0.528 * output["gmi"] +
-        0.404 * output["aqi"] +
-        0.892 * output["sgi"] +
-        0.115 * output["depi"] -
-        0.172 * output["sgai"] +
-        4.679 * output["tata"] -
-        0.327 * output["lvgi"]
+        -4.84
+        + 0.92  * output["dsri"]
+        + 0.528 * output["gmi"]
+        + 0.404 * output["aqi"]
+        + 0.892 * output["sgi"]
+        + 0.115 * output["depi"]
+        - 0.172 * output["sgai"]
+        + 4.679 * output["tata"]
+        - 0.327 * output["lvgi"]
     )
     
-    # Flag missing components
     output["beneish_is_missing"] = output[beneish_components].isna().all(axis=1).astype(float)
     
     return output
@@ -555,30 +586,36 @@ def map_analyst_estimates(
     if estimates_df.empty:
         return pd.DataFrame()
     
-    df = estimates_df.copy()
+    # --- CRITICAL: Deduplicate to latest record per symbol ---
+    # We use the full historical data for signal computation later, 
+    # but the base output frame must be 1-row-per-symbol.
+    df_sorted = estimates_df.sort_values(["symbol", "date"] if "date" in estimates_df.columns else ["symbol"])
+    df = df_sorted.groupby("symbol").last().reset_index()
     
     output = pd.DataFrame()
     output["symbol"] = df["symbol"]
     
     # Map basic fields
-    # analyst_count is a count field, so 0 is appropriate if no analysts
-    output["revision_impulse_analyst_count"] = pd.to_numeric(
-        df.get("number_of_analysts", 0),
-        errors="coerce"
+    def _col_or_nan(df, *candidates):
+        for col in candidates:
+            if col in df.columns:
+                return pd.to_numeric(df[col], errors="coerce")
+        return pd.Series(np.nan, index=df.index, dtype=float)
+
+    output["revision_impulse_analyst_count"] = _col_or_nan(
+        df,
+        "numberAnalystEstimateRevenue",
+        "numberAnalystEstimateEps",
+        "number_of_analysts",
+        "analystCount",
     ).fillna(0)
     
     # EPS estimates
-    if "estimated_eps" in df.columns:
-        output["estimated_eps"] = pd.to_numeric(df["estimated_eps"], errors="coerce")
-    else:
-        output["estimated_eps"] = np.nan
+    output["estimated_eps"] = _col_or_nan(df, "epsAvg", "estimated_eps", "eps")
     
-    # Revenue estimates
-    if "estimated_revenue" in df.columns:
-        output["estimated_revenue"] = pd.to_numeric(df["estimated_revenue"], errors="coerce")
-    else:
-        output["estimated_revenue"] = np.nan
-    
+    # Revenue estimates  
+    output["estimated_revenue"] = _col_or_nan(df, "revenueAvg", "estimated_revenue", "revenue")
+
     # Initialize revision metrics
     output["revision_impulse_signal"] = np.nan
     output["revision_impulse_has_coverage"] = 0.0
@@ -588,6 +625,13 @@ def map_analyst_estimates(
     output["revision_jerk_prior_velocity"] = np.nan
     output["revision_impulse_disagreement"] = np.nan
     output["revision_impulse_disagreement_penalty"] = np.nan
+    
+    # Initialize PEAD and SUE signals
+    output["pead_signal"] = np.nan
+    output["pead_signal_v2"] = np.nan
+    output["sue_signal"] = np.nan
+    output["sue_has_coverage"] = 0.0
+    output["earnings_report_date"] = pd.NaT
     
     # Compute revision impulse from historical data if available
     if historical_estimates_df is not None and not historical_estimates_df.empty:
@@ -653,14 +697,37 @@ def map_analyst_estimates(
                         output["revision_jerk_raw"].notna().astype(float)
                     )
     
-    # Compute revision jerk from surprises if available
+    # Compute revision jerk and PEAD from surprises if available
     if surprises_df is not None and not surprises_df.empty:
-        logger.info("Computing revision jerk from earnings surprises")
+        logger.info("Computing revision jerk and PEAD from earnings surprises")
         
         surprises_df = surprises_df.copy()
         
+        # Derive surprise_percent if missing (common in bulk CSV)
+        if "surprise_percent" not in surprises_df.columns and "actual_eps" in surprises_df.columns and "estimated_eps" in surprises_df.columns:
+            surprises_df["actual_eps"] = pd.to_numeric(surprises_df["actual_eps"], errors="coerce")
+            surprises_df["estimated_eps"] = pd.to_numeric(surprises_df["estimated_eps"], errors="coerce")
+            surprises_df["surprise_percent"] = (
+                (surprises_df["actual_eps"] - surprises_df["estimated_eps"]) / 
+                surprises_df["estimated_eps"].abs().replace(0, np.nan)
+            ) * 100.0
+        
         if "surprise_percent" in surprises_df.columns:
-            # Aggregate surprise by symbol
+            # Sort to get latest surprise
+            sur_sorted = surprises_df.sort_values(["symbol", "date"])
+            latest_sur = sur_sorted.groupby("symbol").last().reset_index()
+            
+            # Map latest surprise to signals
+            sur_map = latest_sur.set_index("symbol")["surprise_percent"]
+            output["pead_signal"] = output["symbol"].map(sur_map) / 100.0  # Normalize %
+            output["sue_signal"] = output["pead_signal"] # Proxy SUE with surprise % for now
+            output["sue_has_coverage"] = output["pead_signal"].notna().astype(float)
+            
+            if "date" in latest_sur.columns:
+                report_dates = latest_sur.set_index("symbol")["date"]
+                output["earnings_report_date"] = output["symbol"].map(report_dates)
+
+            # Aggregate surprise by symbol for disagreement
             surprise_agg = surprises_df.groupby("symbol").agg({
                 "surprise_percent": ["mean", "std", "count"]
             }).reset_index()
@@ -674,10 +741,9 @@ def map_analyst_estimates(
                 output["revision_impulse_disagreement"] = pd.to_numeric(
                     output["surprise_std"],
                     errors="coerce"
-                )
+                ).fillna(0)
                 
-                # Disagreement penalty: higher std = higher penalty
-                # If disagreement is NaN, penalty should be NaN
+                # Disagreement penalty
                 output["revision_impulse_disagreement_penalty"] = (
                     output["revision_impulse_disagreement"] / 10.0
                 ).clip(0.0, 1.0)
@@ -749,47 +815,99 @@ def map_insider_trading(insider_df: pd.DataFrame) -> pd.DataFrame:
     
     df = insider_df.copy()
     
+    # Normalize column names to handle both raw FMP and pre-renamed columns
+    # FMP /stable/insider-trading/latest returns: reportingName, securitiesOwned,
+    # transaction_type, acquisitionOrDisposition, etc.
+    col_aliases = {
+        "reportingName": "insider_name",
+        "insiderName": "insider_name",
+        "securitiesOwned": "shares",
+        "securitiesTransacted": "shares",
+        "acquisitionOrDisposition": "acquisition_or_disposition",
+    }
+    for raw_col, norm_col in col_aliases.items():
+        if raw_col in df.columns and norm_col not in df.columns:
+            df[norm_col] = df[raw_col]
+    
+    # Ensure numeric shares column
+    if "shares" in df.columns:
+        df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0)
+    else:
+        df["shares"] = 0
+    
+    # Ensure insider_name exists for aggregation
+    if "insider_name" not in df.columns:
+        df["insider_name"] = "unknown"
+    
     # Filter for open-market purchases (exclude 10b5-1 plans)
-    # Transaction types: P-Purchase, S-Sale, etc.
+    # FMP transaction_type uses: P-Purchase, S-Sale, A-Award, etc.
     if "transaction_type" in df.columns:
-        open_market_buys = df[
-            df["transaction_type"].str.contains("P", case=False, na=False) &
-            ~df["transaction_type"].str.contains("10b5", case=False, na=False)
-        ]
+        buy_mask = df["transaction_type"].str.contains("P", case=False, na=False)
+        sell_mask = df["transaction_type"].str.contains("S", case=False, na=False)
+        exclude_mask = df["transaction_type"].str.contains("10b5", case=False, na=False)
+        open_market_buys = df[buy_mask & ~exclude_mask]
+        open_market_sells = df[sell_mask & ~exclude_mask]
     else:
         open_market_buys = df
-    
-    if open_market_buys.empty:
-        output = pd.DataFrame(columns=["symbol"])
-        return output
-    
-    # Aggregate by symbol
-    agg = open_market_buys.groupby("symbol").agg({
-        "shares": "sum",
-        "insider_name": "nunique",
-        "value": "sum"
-    }).reset_index()
-    
-    agg.columns = ["symbol", "total_shares_bought", "unique_buyers", "total_value"]
+        open_market_sells = pd.DataFrame()
     
     output = pd.DataFrame()
-    output["symbol"] = agg["symbol"]
-    output["insider_conviction_buy_cluster"] = pd.to_numeric(
-        agg["total_shares_bought"],
-        errors="coerce"
-    )
-    output["insider_conviction_buy_person_count"] = pd.to_numeric(
-        agg["unique_buyers"],
-        errors="coerce"
-    )
     
-    # Placeholder for other metrics
+    if not open_market_buys.empty and "symbol" in open_market_buys.columns:
+        # Aggregate buys by symbol
+        buy_agg = open_market_buys.groupby("symbol").agg(
+            total_shares_bought=("shares", "sum"),
+            unique_buyers=("insider_name", "nunique"),
+            trade_count=("shares", "count"),
+        ).reset_index()
+        
+        output["symbol"] = buy_agg["symbol"]
+        output["insider_conviction_buy_cluster"] = pd.to_numeric(
+            buy_agg["total_shares_bought"], errors="coerce"
+        )
+        output["insider_conviction_buy_person_count"] = pd.to_numeric(
+            buy_agg["unique_buyers"], errors="coerce"
+        )
+        output["insider_conviction_trade_count"] = pd.to_numeric(
+            buy_agg["trade_count"], errors="coerce"
+        )
+    else:
+        output = pd.DataFrame(columns=["symbol"])
+        output["insider_conviction_buy_cluster"] = np.nan
+        output["insider_conviction_buy_person_count"] = np.nan
+        output["insider_conviction_trade_count"] = np.nan
+    
+    # Sell pressure
+    if not open_market_sells.empty and "symbol" in open_market_sells.columns:
+        sell_agg = open_market_sells.groupby("symbol").agg(
+            total_shares_sold=("shares", "sum"),
+            unique_sellers=("insider_name", "nunique"),
+        ).reset_index()
+        output = output.merge(sell_agg[["symbol", "total_shares_sold", "unique_sellers"]], on="symbol", how="outer")
+        output["insider_conviction_sell_pressure"] = pd.to_numeric(
+            output["total_shares_sold"], errors="coerce"
+        )
+        output["insider_conviction_sell_person_count"] = pd.to_numeric(
+            output["unique_sellers"], errors="coerce"
+        )
+        output.drop(columns=["total_shares_sold", "unique_sellers"], inplace=True, errors="ignore")
+    else:
+        output["insider_conviction_sell_pressure"] = np.nan
+        output["insider_conviction_sell_person_count"] = np.nan
+    
+    # Fill remaining fields
     output["insider_conviction_signal"] = np.nan
-    output["insider_conviction_has_coverage"] = 0.0
-    output["insider_conviction_sell_pressure"] = np.nan
-    output["insider_conviction_trade_count"] = np.nan
-    output["insider_conviction_sell_person_count"] = np.nan
+    output["insider_conviction_has_coverage"] = np.where(
+        output["insider_conviction_buy_cluster"].notna() | output["insider_conviction_sell_pressure"].notna(),
+        1.0, 0.0
+    )
     output["insider_short_crowding_penalty"] = 0.0
+    
+    # Fill NaN for columns that might not have been set
+    for col in ["insider_conviction_trade_count", "insider_conviction_buy_cluster",
+                "insider_conviction_buy_person_count"]:
+        if col not in output.columns:
+            output[col] = np.nan
     
     return output
 
@@ -805,19 +923,22 @@ def merge_all_data(
 ) -> pd.DataFrame:
     """
     Merge all mapped data into a single DataFrame for the ranker.
-    
-    Args:
-        profiles_df: Mapped profile data
-        prices_df: Price data
-        financials_df: Mapped financial statements
-        beneish_df: Mapped Beneish components
-        estimates_df: Mapped analyst estimates
-        institutional_df: Mapped institutional ownership
-        insider_df: Mapped insider trading
-        
-    Returns:
-        Unified DataFrame with all columns expected by build_ranked_frame
     """
+    # --- Defensive Deduplication ---
+    # Ensure all dataframes are 1-row-per-symbol before merging to avoid many-to-many explosions
+    def _dedupe(df):
+        if df.empty or "symbol" not in df.columns:
+            return df
+        return df.sort_values("symbol").groupby("symbol").last().reset_index()
+
+    profiles_df = _dedupe(profiles_df)
+    financials_df = _dedupe(financials_df)
+    beneish_df = _dedupe(beneish_df)
+    estimates_df = _dedupe(estimates_df)
+    institutional_df = _dedupe(institutional_df)
+    insider_df = _dedupe(insider_df)
+    # ------------------------------
+
     # Start with profiles
     if not profiles_df.empty:
         merged = profiles_df.copy()
@@ -844,14 +965,43 @@ def merge_all_data(
     if not insider_df.empty:
         merged = merged.merge(insider_df, on="symbol", how="outer")
     
-    # Merge prices
+    # Merge prices (Batch Quote fields)
     if not prices_df.empty:
-        # Get latest price for each symbol
+        # Get latest price/quote for each symbol
         if "date" in prices_df.columns:
             latest_prices = prices_df.sort_values("date").groupby("symbol").last().reset_index()
         else:
             latest_prices = prices_df
+        
+        # Technical Indicator Mapping from Batch Quote
+        price_mapping = {
+            "yearHigh": "52_week_high",
+            "priceAvg200": "200_day_ma",
+            "priceAvg50": "50_day_ma",
+        }
+        for fmp_col, internal_col in price_mapping.items():
+            if fmp_col in latest_prices.columns and internal_col not in latest_prices.columns:
+                latest_prices[internal_col] = latest_prices[fmp_col]
+        
         merged = merged.merge(latest_prices, on="symbol", how="left")
+    
+    # Derived technicals if missing
+    if "price" in merged.columns and "200_day_ma" in merged.columns:
+        merged["price_to_200dma"] = merged["price"] / merged["200_day_ma"].replace(0, np.nan)
+    if "price" in merged.columns and "52_week_high" in merged.columns:
+        merged["distance_from_high"] = merged["price"] / merged["52_week_high"].replace(0, np.nan)
+
+    # --- Deduplicate _x / _y column collisions from multiple merges ---
+    # Prefer _x (earlier source = profile/screener data), then fill with _y
+    x_cols = [c for c in merged.columns if c.endswith("_x")]
+    for xcol in x_cols:
+        base = xcol[:-2]
+        ycol = f"{base}_y"
+        if ycol in merged.columns:
+            merged[base] = merged[xcol].combine_first(merged[ycol])
+            merged.drop(columns=[xcol, ycol], inplace=True)
+        else:
+            merged.rename(columns={xcol: base}, inplace=True)
     
     # Ensure symbol is first column
     if "symbol" in merged.columns:
@@ -865,7 +1015,8 @@ def create_raw_fmp_dataframe(
     bulk_data: Dict[str, pd.DataFrame],
     market: str = "us",
     financial_period: str = "annual",
-    historical_estimates_df: Optional[pd.DataFrame] = None
+    historical_estimates_df: Optional[pd.DataFrame] = None,
+    surprises_df: Optional[pd.DataFrame] = None
 ) -> pd.DataFrame:
     """
     Create the raw DataFrame from FMP bulk data that the ranker expects.
@@ -879,6 +1030,7 @@ def create_raw_fmp_dataframe(
         market: Market identifier
         financial_period: "annual" or "quarterly"
         historical_estimates_df: Historical analyst estimates time series (optional)
+        surprises_df: Earnings surprises data (optional)
         
     Returns:
         Raw DataFrame ready for build_ranked_frame
@@ -907,7 +1059,7 @@ def create_raw_fmp_dataframe(
     mapped_estimates = map_analyst_estimates(
         estimates_df,
         historical_estimates_df=historical_estimates_df,
-        surprises_df=None
+        surprises_df=surprises_df
     )
     
     logger.info("Mapping institutional ownership")
