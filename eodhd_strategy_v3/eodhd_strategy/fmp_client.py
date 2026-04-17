@@ -56,6 +56,37 @@ class FMPClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self._session:
             await self._session.close()
+
+    @staticmethod
+    def _normalize_statement_period(period: str | None) -> str:
+        value = str(period or "annual").strip().lower()
+        if value in {"quarterly", "quarter", "q", "q1", "q2", "q3", "q4"}:
+            return "quarter"
+        if value in {"annual", "year", "yearly", "fy"}:
+            return "annual"
+        return value or "annual"
+
+    @staticmethod
+    def _coalesce_symbol_frames(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+        if left.empty:
+            return right.copy()
+        if right.empty:
+            return left.copy()
+
+        merged = left.merge(right, on="symbol", how="outer", suffixes=("_left", "_right"))
+        left_cols = [c for c in merged.columns if c.endswith("_left")]
+        for left_col in left_cols:
+            base_col = left_col[:-5]
+            right_col = f"{base_col}_right"
+            if right_col in merged.columns:
+                merged[base_col] = merged[right_col].combine_first(merged[left_col])
+                merged.drop(columns=[left_col, right_col], inplace=True)
+            else:
+                merged.rename(columns={left_col: base_col}, inplace=True)
+        for col in list(merged.columns):
+            if col.endswith("_right"):
+                merged.rename(columns={col: col[:-6]}, inplace=True)
+        return merged
     
     async def _get(
         self,
@@ -101,21 +132,28 @@ class FMPClient:
                         try:
                             data = json.loads(text)
                             if isinstance(data, dict):
-                                return data.get("data", [])
+                                if "data" in data:
+                                    payload = data.get("data")
+                                    if isinstance(payload, list):
+                                        return payload
+                                    if isinstance(payload, dict):
+                                        return [payload]
+                                return [data]
                             return data if isinstance(data, list) else [data]
                         except Exception as e:
-                            print(f"Error parsing JSON from {url}: {e}")
+                            logger.warning("Error parsing JSON from %s: %s", url, e)
                             return []
                 
-                # Client errors: raise RuntimeError to make endpoint failures visible during debugging
+                # Graceful degradation on common client errors for optional FMP datasets
                 if response.status in [400, 401, 403, 404]:
-                    body = await response.text()
-                    raise RuntimeError(
-                        f"FMP API error: endpoint='{endpoint}', "
-                        f"url='{url}', "
-                        f"status={response.status}, "
-                        f"body={body[:300]!r}"
+                    body = (await response.text())[:300]
+                    logger.warning(
+                        "FMP API degraded to empty payload for endpoint=%s status=%s body=%r",
+                        endpoint,
+                        response.status,
+                        body,
                     )
+                    return []
                 
                 # Retry on rate limits (429) or server errors (5xx)
                 if response.status in [429, 500, 502, 503, 504]:
@@ -241,9 +279,10 @@ class FMPClient:
         df = pd.DataFrame(data)
         available_mapping = {k: v for k, v in {
             "symbol": "symbol", "mktCap": "market_cap", "marketCap": "market_cap",
-            "sector": "sector", "industry": "industry", 
+            "sector": "sector", "industry": "industry",
             "isActivelyTrading": "is_actively_trading",
             "companyName": "company_name", "exchange": "exchange", "country": "country",
+            "price": "price", "lastAnnualDividend": "lastAnnualDividend", "lastDividend": "lastDividend",
         }.items() if k in df.columns}
         
         df = df.rename(columns=available_mapping)
@@ -263,7 +302,7 @@ class FMPClient:
         all_data = []
         for symbol in symbols[:limit]:
             endpoint = "income-statement"
-            params = {"symbol": symbol, "period": period, "limit": periods}
+            params = {"symbol": symbol, "period": self._normalize_statement_period(period), "limit": periods}
             data = await self._get(endpoint, params)
             if data:
                 # Add symbol to each record if not present
@@ -340,7 +379,7 @@ class FMPClient:
             return pd.DataFrame()
 
         all_data = []
-        period_value = "quarter" if period == "quarterly" else period
+        period_value = self._normalize_statement_period(period)
         for symbol in symbols[:limit]:
             endpoint = "analyst-estimates"
             params = {"symbol": symbol, "period": period_value, "page": 0, "limit": historical_limit}
@@ -364,7 +403,10 @@ class FMPClient:
             "estimatedRevenueAvg": "estimated_revenue",
             "revenueAvg": "estimated_revenue",
             "numberAnalystEstimatedEps": "analyst_count",
+            "numberAnalystEstimateEps": "analyst_count",
             "numberAnalystEstimatedRevenue": "analyst_count_revenue",
+            "numberAnalystEstimateRevenue": "analyst_count_revenue",
+            "analystCount": "analyst_count",
         }.items() if k in df.columns}
         df = df.rename(columns=available_mapping)
 
@@ -703,7 +745,7 @@ class FMPClient:
         all_data = []
         for symbol in symbols[:limit]:
             endpoint = "balance-sheet-statement"
-            params = {"symbol": symbol, "period": period, "limit": periods}
+            params = {"symbol": symbol, "period": self._normalize_statement_period(period), "limit": periods}
             data = await self._get(endpoint, params)
             if data:
                 for record in data:
@@ -739,7 +781,7 @@ class FMPClient:
         all_data = []
         for symbol in symbols[:limit]:
             endpoint = "cash-flow-statement"
-            params = {"symbol": symbol, "period": period, "limit": periods}
+            params = {"symbol": symbol, "period": self._normalize_statement_period(period), "limit": periods}
             data = await self._get(endpoint, params)
             if data:
                 for record in data:
@@ -776,7 +818,7 @@ class FMPClient:
         all_data = []
         for symbol in symbols[:limit]:
             endpoint = "analyst-estimates"
-            params = {"symbol": symbol, "period": period, "page": 0, "limit": historical_limit}
+            params = {"symbol": symbol, "period": self._normalize_statement_period(period), "page": 0, "limit": historical_limit}
             data = await self._get(endpoint, params)
             if data:
                 for record in data:
@@ -792,8 +834,13 @@ class FMPClient:
             "symbol": "symbol", "date": "date",
             "period": "period",
             "estimatedEpsAvg": "estimated_eps", "estimatedEpsHigh": "estimated_eps_high",
-            "estimatedEpsLow": "estimated_eps_low", "numberAnalystEstimatedEps": "analyst_count",
+            "estimatedEpsLow": "estimated_eps_low",
+            "numberAnalystEstimatedEps": "analyst_count",
+            "numberAnalystEstimateEps": "analyst_count",
             "estimatedRevenueAvg": "estimated_revenue",
+            "numberAnalystEstimatedRevenue": "analyst_count_revenue",
+            "numberAnalystEstimateRevenue": "analyst_count_revenue",
+            "analystCount": "analyst_count",
         }.items() if k in df.columns}
         
         df = df.rename(columns=available_mapping)
@@ -877,74 +924,95 @@ class FMPClient:
         self, market: str = "us", financial_period: str = "annual", symbols: list[str] = None
     ) -> Dict[str, pd.DataFrame]:
         """
-        Fetch all available data using /stable/ endpoints.
-        
-        Strategy:
-        1. Get universe from screener or profile-bulk
-        2. Fetch per-symbol data for financial statements
-        3. Fetch bulk/latest data for insider trading
+        Fetch the full FMP payload needed by the mapper and ranker.
         """
-        output = {}
-        
-        # Step 1: Get universe of symbols
+        output: Dict[str, pd.DataFrame] = {}
+
+        screener_df = pd.DataFrame()
+        profile_df = pd.DataFrame()
+
+        # Step 1: discover the universe
         if symbols is None:
-            # Try screener first for active stocks
             screener_df = await self.fetch_screener(
                 is_actively_trading=True,
-                market_cap_more_than=100_000_000,  # $100M+
-                limit=5000
+                market_cap_more_than=100_000_000,
+                limit=5000,
             )
             if not screener_df.empty and "symbol" in screener_df.columns:
-                symbols = screener_df["symbol"].tolist()
+                symbols = screener_df["symbol"].dropna().astype(str).tolist()
                 output["screener"] = screener_df
-            else:
-                # Fallback to profile-bulk
-                profile_df = await self.fetch_profile_bulk(market=market, part=0)
-                if not profile_df.empty and "symbol" in profile_df.columns:
-                    symbols = profile_df["symbol"].tolist()[:500]  # Limit to 500
-                    output["profiles"] = profile_df
-                else:
-                    symbols = []
-        
+
+            profile_df = await self.fetch_profile_bulk(market=market, part=0)
+            if profile_df.empty and symbols is None:
+                symbols = []
+            elif symbols is None and not profile_df.empty and "symbol" in profile_df.columns:
+                symbols = profile_df["symbol"].dropna().astype(str).tolist()[:500]
+
+        symbols = [str(symbol).strip() for symbol in (symbols or []) if str(symbol).strip()]
         if not symbols:
-            # Return empty data if we can't get symbols
             return {k: pd.DataFrame() for k in [
-                "profiles", "prices", "income_statements", "balance_sheets", 
-                "cash_flows", "insider_trading", "analyst_estimates", "institutional_ownership"
+                "profiles",
+                "prices",
+                "income_statements",
+                "balance_sheets",
+                "cash_flows",
+                "insider_trading",
+                "insider_statistics",
+                "analyst_estimates",
+                "historical_estimates",
+                "earnings_surprises",
+                "institutional_ownership",
+                "employee_count",
+                "scores",
+                "price_history",
             ]}
-        
-        # Step 2: Fetch bulk data that works without symbols
-        output["insider_trading"] = await self.fetch_insider_trading_bulk(page=0, limit=100)
-        
-        # Step 3: Fetch per-symbol data (limit to first 100 symbols to avoid rate limits)
-        limited_symbols = symbols[:100]
-        
-        # Fetch prices for all symbols at once using batch-quote
-        output["prices"] = await self.fetch_bulk_daily_prices(symbols=limited_symbols)
-        
-        # Fetch financial statements per-symbol
-        output["income_statements"] = await self.fetch_income_statement_bulk(
-            symbols=limited_symbols, period=financial_period
+
+        limited_symbols = symbols[: max(1, int(self.config.batch_size or 100))]
+        estimate_period = self._normalize_statement_period(financial_period)
+
+        if profile_df.empty:
+            profile_df = await self.fetch_profile_bulk(market=market, part=0)
+        if not profile_df.empty and "symbol" in profile_df.columns:
+            profile_df = profile_df[profile_df["symbol"].isin(set(limited_symbols))]
+        if not screener_df.empty and "symbol" in screener_df.columns:
+            screener_subset = screener_df[screener_df["symbol"].isin(set(limited_symbols))].copy()
+            output["profiles"] = self._coalesce_symbol_frames(screener_subset, profile_df)
+        else:
+            output["profiles"] = profile_df.copy()
+
+        (
+            output["insider_trading"],
+            output["insider_statistics"],
+            output["prices"],
+            output["income_statements"],
+            output["balance_sheets"],
+            output["cash_flows"],
+            output["analyst_estimates"],
+            output["historical_estimates"],
+            output["earnings_surprises"],
+            output["institutional_ownership"],
+            output["employee_count"],
+            output["scores"],
+            output["price_history"],
+        ) = await asyncio.gather(
+            self.fetch_insider_trading_bulk(page=0, limit=100),
+            self.fetch_insider_trading_statistics_bulk(symbols=limited_symbols, limit=len(limited_symbols)),
+            self.fetch_bulk_daily_prices(symbols=limited_symbols),
+            self.fetch_income_statement_bulk(symbols=limited_symbols, period=financial_period, limit=len(limited_symbols)),
+            self.fetch_balance_sheet_bulk(symbols=limited_symbols, period=financial_period, limit=len(limited_symbols)),
+            self.fetch_cash_flow_bulk(symbols=limited_symbols, period=financial_period, limit=len(limited_symbols)),
+            self.fetch_analyst_estimates_bulk(symbols=limited_symbols, period=estimate_period, limit=len(limited_symbols), historical_limit=20),
+            self.fetch_financial_estimates_bulk(symbols=limited_symbols, period=estimate_period, limit=len(limited_symbols), historical_limit=20),
+            self.fetch_earnings_surprises_bulk(year=datetime.now().year),
+            self.fetch_institutional_ownership_bulk(symbols=limited_symbols),
+            self.fetch_employee_count_bulk(symbols=limited_symbols, limit=len(limited_symbols)),
+            self.fetch_scores_bulk(symbols=limited_symbols),
+            self.fetch_historical_price_eod_bulk(symbols=limited_symbols, mode="full", limit=len(limited_symbols)),
         )
-        output["balance_sheets"] = await self.fetch_balance_sheet_bulk(
-            symbols=limited_symbols, period=financial_period
-        )
-        output["cash_flows"] = await self.fetch_cash_flow_bulk(
-            symbols=limited_symbols, period=financial_period
-        )
-        
-        # Fetch estimates and institutional ownership per-symbol
-        output["analyst_estimates"] = await self.fetch_analyst_estimates_bulk(
-            symbols=limited_symbols, period=financial_period
-        )
-        output["institutional_ownership"] = await self.fetch_institutional_ownership_bulk(
-            symbols=limited_symbols
-        )
-        
-        # Ensure profiles exists (from screener or fetch separately)
-        if "profiles" not in output and "screener" in output:
-            output["profiles"] = output["screener"]
-        elif "profiles" not in output:
-            output["profiles"] = pd.DataFrame()
-            
+
+        if not output["earnings_surprises"].empty and "symbol" in output["earnings_surprises"].columns:
+            output["earnings_surprises"] = output["earnings_surprises"][
+                output["earnings_surprises"]["symbol"].isin(set(limited_symbols))
+            ].copy()
+
         return output
