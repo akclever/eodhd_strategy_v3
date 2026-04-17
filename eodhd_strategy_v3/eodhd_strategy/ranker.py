@@ -2191,7 +2191,7 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
             pd.DataFrame(),
             beneish_gate_threshold=beneish_gate_threshold,
             large_universe_forensic_mode=large_universe_forensic_mode,
-            universe_size=int(getattr(config, "universe_size", len(raw_df)) or len(raw_df)),
+            universe_size=int(len(df)),
         )
 
     if getattr(config, "use_residual_valuation", False):
@@ -2981,7 +2981,7 @@ def build_ranked_frame(raw_df: pd.DataFrame, config: RankerConfig) -> Tuple[pd.D
         eligible,
         beneish_gate_threshold=beneish_gate_threshold,
         large_universe_forensic_mode=large_universe_forensic_mode,
-        universe_size=int(getattr(config, "universe_size", len(raw_df)) or len(raw_df)),
+        universe_size=int(len(df)),
     )
 
 

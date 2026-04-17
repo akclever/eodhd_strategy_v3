@@ -82,10 +82,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-token", default=None)
     parser.add_argument(
         "--data-provider",
-        choices=["eodhd", "alpha_vantage", "hybrid"],
+        choices=["eodhd", "alpha_vantage", "hybrid", "fmp"],
         default="eodhd",
-        help="Data provider mode: eodhd (default), alpha_vantage, or hybrid (AV primary with EODHD fallback)",
+        help="Data provider mode: eodhd (default), alpha_vantage, hybrid (AV primary with EODHD fallback), or fmp (Financial Modeling Prep)",
     )
+    parser.add_argument("--fmp-api-key", default=None, help="FMP API key (or set FMP_API_KEY env var)")
     parser.add_argument("--alpha-vantage-api-key", default=None, help="Alpha Vantage API key (or set ALPHA_VANTAGE_API_KEY env var)")
     parser.add_argument("--sec-edgar-email", default=None, help="Email for SEC EDGAR User-Agent (or set SEC_EDGAR_EMAIL env var)")
 
@@ -939,6 +940,7 @@ def _make_client(config: RankerConfig) -> DataProvider:
     eodhd_client: EODHDClient | None = None
     av_client: AlphaVantageClient | None = None
     edgar_client: SECEdgarClient | None = None
+    fmp_client: "FMPClient" | None = None  # noqa: F821 – lazy import
 
     if mode in ("eodhd", "hybrid"):
         eodhd_client = EODHDClient(
@@ -955,6 +957,16 @@ def _make_client(config: RankerConfig) -> DataProvider:
             refresh=config.refresh,
         )
 
+    fmp_key = getattr(config, "fmp_api_key", "") or ""
+    if mode == "fmp" and fmp_key:
+        from eodhd_strategy.fmp_client import FMPClient, FMPConfig
+        fmp_client = FMPClient(
+            FMPConfig(
+                api_key=fmp_key,
+                cache_dir=cache_dir,
+            )
+        )
+
     edgar_email = getattr(config, "sec_edgar_email", "") or ""
     if edgar_email and "@" in edgar_email:
         edgar_client = SECEdgarClient(
@@ -968,6 +980,7 @@ def _make_client(config: RankerConfig) -> DataProvider:
         eodhd_client=eodhd_client,
         av_client=av_client,
         edgar_client=edgar_client,
+        fmp_client=fmp_client,
     )
 
 
@@ -1322,6 +1335,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Error: missing Alpha Vantage API key. Use --alpha-vantage-api-key or set ALPHA_VANTAGE_API_KEY.", file=sys.stderr)
         return 2
 
+    fmp_api_key = getattr(args, "fmp_api_key", None) or os.getenv("FMP_API_KEY") or ""
+    if not fmp_api_key and data_provider_mode == "fmp":
+        print("Error: missing FMP API key. Use --fmp-api-key or set FMP_API_KEY.", file=sys.stderr)
+        return 2
+
     sec_edgar_email = getattr(args, "sec_edgar_email", None) or os.getenv("SEC_EDGAR_EMAIL") or ""
 
     initial_macro_state = (
@@ -1418,6 +1436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         price_momentum_source_mode="history_only" if bool(args.require_real_momentum_coverage) else "auto",
         data_provider=data_provider_mode,
         alpha_vantage_api_key=av_api_key,
+        fmp_api_key=fmp_api_key,
         sec_edgar_email=sec_edgar_email,
         use_technical_momentum=bool(getattr(args, "use_technical_momentum", False)),
         technical_momentum_weight=float(getattr(args, "technical_momentum_weight", 0.05)),
@@ -1486,6 +1505,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parts = [f"Data provider: {data_provider_mode}"]
         if av_api_key:
             parts.append("AV=active")
+        if fmp_api_key:
+            parts.append("FMP=active")
         if sec_edgar_email:
             parts.append(f"EDGAR={sec_edgar_email}")
         print(" | ".join(parts), file=sys.stderr)

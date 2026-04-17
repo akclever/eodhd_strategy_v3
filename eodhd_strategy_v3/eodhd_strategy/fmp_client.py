@@ -77,7 +77,17 @@ class FMPClient:
             async with self._session.get(url, params=params) as response:
                 if response.status == 200:
                     text = await response.text()
-                    if text.startswith("symbol,") or text.startswith('"symbol",') or text.startswith('symbol\r') or text.startswith('symbol\n'):
+                    text_lstrip = text.lstrip("\ufeff\n\r \t")
+                    first_line = text_lstrip.splitlines()[0] if text_lstrip else ""
+                    first_line_lower = first_line.lower()
+                    looks_like_csv = (
+                        text_lstrip.startswith("symbol,")
+                        or text_lstrip.startswith('"symbol",')
+                        or text_lstrip.startswith('symbol\r')
+                        or text_lstrip.startswith('symbol\n')
+                        or ("," in first_line and "symbol" in first_line_lower)
+                    )
+                    if looks_like_csv:
                         import io
                         import pandas as pd
                         try:
@@ -97,10 +107,15 @@ class FMPClient:
                             print(f"Error parsing JSON from {url}: {e}")
                             return []
                 
-                # Graceful Degradation: Do not crash if tier limits or missing endpoints are hit
+                # Client errors: raise RuntimeError to make endpoint failures visible during debugging
                 if response.status in [400, 401, 403, 404]:
-                    # Silent skip - don't print anything to avoid garbled output
-                    return []
+                    body = await response.text()
+                    raise RuntimeError(
+                        f"FMP API error: endpoint='{endpoint}', "
+                        f"url='{url}', "
+                        f"status={response.status}, "
+                        f"body={body[:300]!r}"
+                    )
                 
                 # Retry on rate limits (429) or server errors (5xx)
                 if response.status in [429, 500, 502, 503, 504]:
@@ -239,16 +254,16 @@ class FMPClient:
         return df
     
     async def fetch_income_statement_bulk(
-        self, symbols: list[str] = None, period: str = "annual", limit: int = 100
+        self, symbols: list[str] = None, period: str = "annual", limit: int = 100, periods: int = 4
     ) -> pd.DataFrame:
         """Fetch income statements per-symbol using /stable/income-statement."""
         if not symbols:
             return pd.DataFrame()
-            
+
         all_data = []
         for symbol in symbols[:limit]:
             endpoint = "income-statement"
-            params = {"symbol": symbol, "period": period}
+            params = {"symbol": symbol, "period": period, "limit": periods}
             data = await self._get(endpoint, params)
             if data:
                 # Add symbol to each record if not present
@@ -276,17 +291,419 @@ class FMPClient:
             df["date"] = pd.to_datetime(df["date"])
         return df
 
+    async def fetch_employee_count_bulk(
+        self, symbols: list[str] = None, limit: int = 100
+    ) -> pd.DataFrame:
+        """Fetch employee counts per-symbol using /stable/employee-count."""
+        if not symbols:
+            return pd.DataFrame()
+
+        all_data = []
+        for symbol in symbols[:limit]:
+            endpoint = "employee-count"
+            params = {"symbol": symbol}
+            data = await self._get(endpoint, params)
+            if data:
+                for record in data:
+                    if "symbol" not in record:
+                        record["symbol"] = symbol
+                all_data.extend(data)
+
+        if not all_data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_data)
+        available_mapping = {k: v for k, v in {
+            "symbol": "symbol",
+            "date": "date",
+            "employeeCount": "full_time_employees",
+            "fullTimeEmployees": "full_time_employees",
+            "employees": "full_time_employees",
+        }.items() if k in df.columns}
+
+        df = df.rename(columns=available_mapping)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        if "full_time_employees" in df.columns:
+            df["full_time_employees"] = pd.to_numeric(df["full_time_employees"], errors="coerce")
+        return df
+
+    async def fetch_financial_estimates_bulk(
+        self,
+        symbols: list[str] = None,
+        period: str = "quarter",
+        limit: int = 100,
+        historical_limit: int = 20,
+    ) -> pd.DataFrame:
+        """Fetch financial estimates using /stable/analyst-estimates."""
+        if not symbols:
+            return pd.DataFrame()
+
+        all_data = []
+        period_value = "quarter" if period == "quarterly" else period
+        for symbol in symbols[:limit]:
+            endpoint = "analyst-estimates"
+            params = {"symbol": symbol, "period": period_value, "page": 0, "limit": historical_limit}
+            data = await self._get(endpoint, params)
+            if data:
+                for record in data:
+                    if "symbol" not in record:
+                        record["symbol"] = symbol
+                all_data.extend(data)
+
+        if not all_data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_data)
+        available_mapping = {k: v for k, v in {
+            "symbol": "symbol",
+            "date": "date",
+            "period": "period",
+            "estimatedEpsAvg": "estimated_eps",
+            "epsAvg": "estimated_eps",
+            "estimatedRevenueAvg": "estimated_revenue",
+            "revenueAvg": "estimated_revenue",
+            "numberAnalystEstimatedEps": "analyst_count",
+            "numberAnalystEstimatedRevenue": "analyst_count_revenue",
+        }.items() if k in df.columns}
+        df = df.rename(columns=available_mapping)
+
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for col in ["estimated_eps", "estimated_revenue", "analyst_count", "analyst_count_revenue"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
+    async def fetch_earnings_company_bulk(
+        self, symbols: list[str] = None, limit: int = 100
+    ) -> pd.DataFrame:
+        """Fetch per-symbol earnings history via /stable/earnings-company."""
+        if not symbols:
+            return pd.DataFrame()
+
+        all_data = []
+        for symbol in symbols[:limit]:
+            endpoint = "earnings-company"
+            params = {"symbol": symbol}
+            logger.debug(f"FMP: calling endpoint={endpoint} for symbol={symbol}")
+            data = await self._get(endpoint, params)
+            if data:
+                for record in data:
+                    if "symbol" not in record:
+                        record["symbol"] = symbol
+                all_data.extend(data)
+
+        if not all_data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_data)
+        available_mapping = {k: v for k, v in {
+            "symbol": "symbol",
+            "date": "date",
+            "period": "period",
+            "actualEps": "actual_eps",
+            "epsActual": "actual_eps",
+            "estimatedEps": "estimated_eps",
+            "epsEstimated": "estimated_eps",
+            "surprisePercent": "surprise_percent",
+        }.items() if k in df.columns}
+        df = df.rename(columns=available_mapping)
+
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for col in ["actual_eps", "estimated_eps", "surprise_percent"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
+    async def fetch_insider_trading_statistics_bulk(
+        self, symbols: list[str] = None, limit: int = 100
+    ) -> pd.DataFrame:
+        """Fetch insider summary statistics via /stable/insider-trading/statistics."""
+        if not symbols:
+            return pd.DataFrame()
+
+        all_data = []
+        for symbol in symbols[:limit]:
+            endpoint = "insider-trading/statistics"
+            params = {"symbol": symbol}
+            data = await self._get(endpoint, params)
+            if data:
+                for record in data:
+                    if "symbol" not in record:
+                        record["symbol"] = symbol
+                all_data.extend(data)
+
+        if not all_data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_data)
+        available_mapping = {k: v for k, v in {
+            "symbol": "symbol",
+            "totalBuy": "total_buy",
+            "totalSell": "total_sell",
+            "buyCount": "buy_count",
+            "sellCount": "sell_count",
+            "netActivity": "net_activity",
+            "totalTransactions": "trade_count",
+        }.items() if k in df.columns}
+        df = df.rename(columns=available_mapping)
+
+        for col in ["total_buy", "total_sell", "buy_count", "sell_count", "net_activity", "trade_count"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
+    async def fetch_income_statement_bulk_by_year(
+        self, year: int, period: str = "annual", symbols: list[str] = None
+    ) -> pd.DataFrame:
+        """Fetch yearly income statement bulk via /stable/income-statement-bulk."""
+        endpoint = "income-statement-bulk"
+        params = {"year": year, "period": period}
+        data = await self._get(endpoint, params)
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        if symbols and "symbol" in df.columns:
+            df = df[df["symbol"].isin(set(symbols))]
+        return df
+
+    async def fetch_income_statement_growth_bulk_by_year(
+        self, year: int, period: str = "annual", symbols: list[str] = None
+    ) -> pd.DataFrame:
+        """Fetch yearly income growth bulk via /stable/income-statement-growth-bulk."""
+        endpoint = "income-statement-growth-bulk"
+        params = {"year": year, "period": period}
+        data = await self._get(endpoint, params)
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        if symbols and "symbol" in df.columns:
+            df = df[df["symbol"].isin(set(symbols))]
+        return df
+
+    async def fetch_balance_sheet_bulk_by_year(
+        self, year: int, period: str = "annual", symbols: list[str] = None
+    ) -> pd.DataFrame:
+        """Fetch yearly balance sheet bulk via /stable/balance-sheet-statement-bulk."""
+        endpoint = "balance-sheet-statement-bulk"
+        params = {"year": year, "period": period}
+        data = await self._get(endpoint, params)
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        if symbols and "symbol" in df.columns:
+            df = df[df["symbol"].isin(set(symbols))]
+        return df
+
+    async def fetch_cash_flow_bulk_by_year(
+        self, year: int, period: str = "annual", symbols: list[str] = None
+    ) -> pd.DataFrame:
+        """Fetch yearly cash flow bulk via /stable/cash-flow-statement-bulk."""
+        endpoint = "cash-flow-statement-bulk"
+        params = {"year": year, "period": period}
+        data = await self._get(endpoint, params)
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        if symbols and "symbol" in df.columns:
+            df = df[df["symbol"].isin(set(symbols))]
+        return df
+
+    async def fetch_scores_bulk(self, symbols: list[str] = None) -> pd.DataFrame:
+        """Fetch score set via /stable/scores-bulk (includes piotroski)."""
+        endpoint = "scores-bulk"
+        data = await self._get(endpoint, params={})
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        if symbols and "symbol" in df.columns:
+            df = df[df["symbol"].isin(set(symbols))]
+        return df
+
+    async def fetch_historical_price_eod_bulk(
+        self, symbols: list[str] = None, mode: str = "full", limit: int = 100
+    ) -> pd.DataFrame:
+        """Fetch historical EOD prices via /stable/historical-price-eod/{full|light}."""
+        if not symbols:
+            return pd.DataFrame()
+
+        endpoint = "historical-price-eod/full" if mode == "full" else "historical-price-eod/light"
+        all_data = []
+        for symbol in symbols[:limit]:
+            data = await self._get(endpoint, {"symbol": symbol})
+            if not data:
+                continue
+            for record in data:
+                if "symbol" not in record:
+                    record["symbol"] = symbol
+            all_data.extend(data)
+
+        if not all_data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_data)
+        mapping = {
+            "symbol": "symbol",
+            "date": "date",
+            "close": "close",
+            "adjClose": "adj_close",
+            "adjustedClose": "adj_close",
+            "volume": "volume",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+        }
+        available_mapping = {k: v for k, v in mapping.items() if k in df.columns}
+        df = df.rename(columns=available_mapping)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for col in ["open", "high", "low", "close", "adj_close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
+    async def fetch_eod_bulk(self, date: str) -> pd.DataFrame:
+        """Fetch one-day bulk EOD cross section via /stable/eod-bulk."""
+        endpoint = "eod-bulk"
+        data = await self._get(endpoint, {"date": date})
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        return df
+
+    async def fetch_technical_indicator_bulk(
+        self,
+        indicator: str,
+        symbols: list[str] = None,
+        period_length: int = 14,
+        timeframe: str = "1day",
+        limit: int = 100,
+    ) -> pd.DataFrame:
+        """Fetch technical indicator series for symbols via /stable/technical-indicators/{indicator}."""
+        if not symbols:
+            return pd.DataFrame()
+
+        endpoint = f"technical-indicators/{indicator}"
+        all_data = []
+        for symbol in symbols[:limit]:
+            params = {"symbol": symbol, "periodLength": period_length, "timeframe": timeframe}
+            data = await self._get(endpoint, params)
+            if not data:
+                continue
+            for record in data:
+                if "symbol" not in record:
+                    record["symbol"] = symbol
+                record["indicator_type"] = indicator
+            all_data.extend(data)
+
+        if not all_data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_data)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        return df
+
+    async def fetch_peers_bulk(self) -> pd.DataFrame:
+        """Fetch full peers list via /stable/peers-bulk."""
+        data = await self._get("peers-bulk", params={})
+        if not data:
+            return pd.DataFrame()
+        return pd.DataFrame(data)
+
+    async def fetch_peers_for_symbols(self, symbols: list[str] = None, limit: int = 100) -> pd.DataFrame:
+        """Fetch symbol peers via /stable/stock-peers?symbol=..."""
+        if not symbols:
+            return pd.DataFrame()
+        all_data = []
+        endpoint = "stock-peers"
+        for symbol in symbols[:limit]:
+            logger.debug(f"FMP: calling endpoint={endpoint} for symbol={symbol}")
+            data = await self._get(endpoint, {"symbol": symbol})
+            if not data:
+                continue
+            for record in data:
+                if "symbol" not in record:
+                    record["symbol"] = symbol
+            all_data.extend(data)
+        return pd.DataFrame(all_data) if all_data else pd.DataFrame()
+
+    async def fetch_search_insider_trades_bulk(self, symbols: list[str] = None, limit: int = 100) -> pd.DataFrame:
+        """Fetch insider trades per symbol via /stable/insider-trading/search."""
+        if not symbols:
+            return pd.DataFrame()
+        all_data = []
+        endpoint = "insider-trading/search"
+        for symbol in symbols[:limit]:
+            logger.debug(f"FMP: calling endpoint={endpoint} for symbol={symbol}")
+            data = await self._get(endpoint, {"symbol": symbol})
+            if not data:
+                continue
+            for record in data:
+                if "symbol" not in record:
+                    record["symbol"] = symbol
+            all_data.extend(data)
+        return pd.DataFrame(all_data) if all_data else pd.DataFrame()
+
+    async def fetch_historical_employee_count_bulk(self, symbols: list[str] = None, limit: int = 100) -> pd.DataFrame:
+        """Fetch historical employee counts via /stable/historical-employee-count."""
+        if not symbols:
+            return pd.DataFrame()
+        all_data = []
+        for symbol in symbols[:limit]:
+            data = await self._get("historical-employee-count", {"symbol": symbol})
+            if not data:
+                continue
+            for record in data:
+                if "symbol" not in record:
+                    record["symbol"] = symbol
+            all_data.extend(data)
+        if not all_data:
+            return pd.DataFrame()
+        df = pd.DataFrame(all_data)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        return df
+
+    async def fetch_positions_summary_bulk(
+        self, symbols: list[str] = None, limit: int = 100, year: int = None, quarter: int = None
+    ) -> pd.DataFrame:
+        """Fetch institutional summary via /stable/institutional-ownership/symbol-positions-summary."""
+        if not symbols:
+            return pd.DataFrame()
+        all_data = []
+        endpoint = "institutional-ownership/symbol-positions-summary"
+        for symbol in symbols[:limit]:
+            params = {"symbol": symbol}
+            if year is not None:
+                params["year"] = year
+            if quarter is not None:
+                params["quarter"] = quarter
+            logger.debug(f"FMP: calling endpoint={endpoint} for symbol={symbol}")
+            data = await self._get(endpoint, params)
+            if not data:
+                continue
+            for record in data:
+                if "symbol" not in record:
+                    record["symbol"] = symbol
+            all_data.extend(data)
+        return pd.DataFrame(all_data) if all_data else pd.DataFrame()
+
     async def fetch_balance_sheet_bulk(
-        self, symbols: list[str] = None, period: str = "annual", limit: int = 100
+        self, symbols: list[str] = None, period: str = "annual", limit: int = 100, periods: int = 4
     ) -> pd.DataFrame:
         """Fetch balance sheets per-symbol using /stable/balance-sheet-statement."""
         if not symbols:
             return pd.DataFrame()
-            
+
         all_data = []
         for symbol in symbols[:limit]:
             endpoint = "balance-sheet-statement"
-            params = {"symbol": symbol, "period": period}
+            params = {"symbol": symbol, "period": period, "limit": periods}
             data = await self._get(endpoint, params)
             if data:
                 for record in data:
@@ -313,16 +730,16 @@ class FMPClient:
         return df
 
     async def fetch_cash_flow_bulk(
-        self, symbols: list[str] = None, period: str = "annual", limit: int = 100
+        self, symbols: list[str] = None, period: str = "annual", limit: int = 100, periods: int = 4
     ) -> pd.DataFrame:
         """Fetch cash flow statements per-symbol using /stable/cash-flow-statement."""
         if not symbols:
             return pd.DataFrame()
-            
+
         all_data = []
         for symbol in symbols[:limit]:
             endpoint = "cash-flow-statement"
-            params = {"symbol": symbol, "period": period}
+            params = {"symbol": symbol, "period": period, "limit": periods}
             data = await self._get(endpoint, params)
             if data:
                 for record in data:
@@ -373,6 +790,7 @@ class FMPClient:
         df = pd.DataFrame(all_data)
         available_mapping = {k: v for k, v in {
             "symbol": "symbol", "date": "date",
+            "period": "period",
             "estimatedEpsAvg": "estimated_eps", "estimatedEpsHigh": "estimated_eps_high",
             "estimatedEpsLow": "estimated_eps_low", "numberAnalystEstimatedEps": "analyst_count",
             "estimatedRevenueAvg": "estimated_revenue",

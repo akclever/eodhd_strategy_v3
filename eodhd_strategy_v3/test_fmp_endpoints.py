@@ -143,6 +143,39 @@ async def main(args):
             symbols=test_symbols
         )
         
+        # Test corrected endpoints
+        results["earnings_company"] = await test_endpoint(
+            client,
+            "Earnings Company (earnings-company endpoint)",
+            client.fetch_earnings_company_bulk,
+            symbols=["AAPL"],
+            limit=1
+        )
+        
+        results["insider_search"] = await test_endpoint(
+            client,
+            "Insider Trading Search (insider-trading/search endpoint)",
+            client.fetch_search_insider_trades_bulk,
+            symbols=["AAPL"],
+            limit=1
+        )
+        
+        results["stock_peers"] = await test_endpoint(
+            client,
+            "Stock Peers (stock-peers endpoint)",
+            client.fetch_peers_for_symbols,
+            symbols=["AAPL"],
+            limit=1
+        )
+        
+        results["positions_summary"] = await test_endpoint(
+            client,
+            "Positions Summary (institutional-ownership/symbol-positions-summary endpoint)",
+            client.fetch_positions_summary_bulk,
+            symbols=["AAPL"],
+            limit=1
+        )
+        
         results["insider"] = await test_endpoint(
             client,
             "Insider Trading Latest",

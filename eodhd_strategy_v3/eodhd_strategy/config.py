@@ -82,6 +82,7 @@ class RankerConfig:
     employee_efficiency_weight: float
     data_provider: Literal["eodhd", "alpha_vantage", "hybrid", "fmp"] = "eodhd"
     alpha_vantage_api_key: str = ""
+    fmp_api_key: str = ""
     sec_edgar_email: str = ""
     analysis_from_primary_ticker: bool = False
     exclude_special_situations: bool = False

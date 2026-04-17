@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,6 +33,16 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def _coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure DataFrame has unique column labels by coalescing duplicate-name columns."""
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    if df.columns.is_unique:
+        return df
+    # Transpose-groupby-first coalesces duplicate columns, preferring first non-null values
+    return df.T.groupby(level=0).first().T
 
 
 def parse_args():
@@ -113,6 +124,33 @@ def parse_args():
         "--verify",
         action="store_true",
         help="Run verification checks after ranking"
+    )
+    parser.add_argument(
+        "--trace-sparsity",
+        action="store_true",
+        help="Log raw->mapped sparsity trace for key factor families"
+    )
+    parser.add_argument(
+        "--trace-sample-size",
+        type=int,
+        default=10,
+        help="Number of symbols to include in sparsity trace sample"
+    )
+    parser.add_argument(
+        "--symbols",
+        default="",
+        help="Comma-separated symbols to run (overrides screener-derived symbol list for per-ticker fetches)"
+    )
+    parser.add_argument(
+        "--max-symbols",
+        type=int,
+        default=500,
+        help="Maximum symbols to use for per-ticker endpoints when --symbols is not provided"
+    )
+    parser.add_argument(
+        "--fast-debug-pead",
+        action="store_true",
+        help="Fetch PEAD-related data first and skip heavy optional endpoints for faster debug iteration"
     )
     
     return parser.parse_args()
@@ -270,6 +308,8 @@ async def run_fmp_ranker(args):
     logger.info(f"Market: {args.market}")
     logger.info(f"Financial period: {args.financial_period}")
     logger.info(f"Minimum market cap: ${args.min_market_cap:,.0f}")
+    if args.fast_debug_pead:
+        logger.info("Fast debug mode: PEAD-first fetch order with heavy endpoints skipped")
     
     # Fetch all bulk data from FMP
     async with FMPClient(fmp_config) as client:
@@ -299,30 +339,151 @@ async def run_fmp_ranker(args):
             screener_sorted = screener_df.sort_values("market_cap", ascending=False)
         else:
             screener_sorted = screener_df
-        symbols = screener_sorted["symbol"].tolist()[:500]
-        logger.info(f"  Using top {len(symbols)} symbols for per-ticker data")
+        if args.symbols:
+            symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            logger.info(f"  Using explicit symbol override: {symbols}")
+
+            profile_subset = screener_df[screener_df["symbol"].astype(str).isin(symbols)].copy()
+            if profile_subset.empty:
+                logger.warning("  Explicit symbols not found in screener output; creating minimal profile rows")
+                profile_subset = pd.DataFrame({"symbol": symbols})
+            bulk_data["profiles"] = profile_subset
+        else:
+            max_symbols = max(1, int(args.max_symbols))
+            symbols = screener_sorted["symbol"].tolist()[:max_symbols]
+            logger.info(f"  Using top {len(symbols)} symbols for per-ticker data")
+
+        async def fetch_earnings_surprises_bundle() -> tuple[pd.DataFrame, pd.DataFrame]:
+            logger.info("Step 5: Fetching bulk earnings surprises (2025-2026)...")
+            surprises_2026 = await client.fetch_earnings_surprises_bulk(year=2026)
+            surprises_2025 = await client.fetch_earnings_surprises_bulk(year=2025)
+            earnings_company_df = await client.fetch_earnings_company_bulk(symbols=symbols, limit=500)
+            earnings_surprises_df = pd.concat(
+                [surprises_2026, surprises_2025, earnings_company_df],
+                ignore_index=True,
+            ).drop_duplicates()
+            logger.info(f"  Earnings surprises: {len(earnings_surprises_df)} records")
+            logger.info(f"  Earnings company history: {len(earnings_company_df)} records")
+            return earnings_surprises_df, earnings_company_df
+
+        if args.fast_debug_pead:
+            logger.info("Step 1b: Fast mode prefetch of PEAD inputs...")
+            bulk_data["earnings_surprises"], _ = await fetch_earnings_surprises_bundle()
         
         # Step 2: Fetch per-ticker financial statements
         logger.info("Step 2: Fetching financial statements...")
         bulk_data["income_statements"] = await client.fetch_income_statement_bulk(
             symbols=symbols, period=args.financial_period
         )
+        current_year = datetime.now().year
+        income_bulk_current = await client.fetch_income_statement_bulk_by_year(
+            year=current_year,
+            period=args.financial_period,
+            symbols=symbols,
+        )
+        income_bulk_prev = await client.fetch_income_statement_bulk_by_year(
+            year=current_year - 1,
+            period=args.financial_period,
+            symbols=symbols,
+        )
+        bulk_data["income_statements"] = pd.concat(
+            [
+                _coalesce_duplicate_columns(bulk_data["income_statements"]),
+                _coalesce_duplicate_columns(income_bulk_current),
+                _coalesce_duplicate_columns(income_bulk_prev),
+            ],
+            ignore_index=True,
+        ).drop_duplicates()
         logger.info(f"  Income statements: {len(bulk_data['income_statements'])} records")
+        if not bulk_data["income_statements"].empty and "symbol" in bulk_data["income_statements"].columns:
+            income_symbols = bulk_data["income_statements"]["symbol"].unique().tolist()
+            logger.info(f"    Symbols with income data: {income_symbols}")
+            logger.info(f"    Periods per symbol: {bulk_data['income_statements'].groupby('symbol').size().to_dict()}")
         
         bulk_data["balance_sheets"] = await client.fetch_balance_sheet_bulk(
             symbols=symbols, period=args.financial_period
         )
+        balance_bulk_current = await client.fetch_balance_sheet_bulk_by_year(
+            year=current_year,
+            period=args.financial_period,
+            symbols=symbols,
+        )
+        balance_bulk_prev = await client.fetch_balance_sheet_bulk_by_year(
+            year=current_year - 1,
+            period=args.financial_period,
+            symbols=symbols,
+        )
+        bulk_data["balance_sheets"] = pd.concat(
+            [
+                _coalesce_duplicate_columns(bulk_data["balance_sheets"]),
+                _coalesce_duplicate_columns(balance_bulk_current),
+                _coalesce_duplicate_columns(balance_bulk_prev),
+            ],
+            ignore_index=True,
+        ).drop_duplicates()
         logger.info(f"  Balance sheets: {len(bulk_data['balance_sheets'])} records")
+        if not bulk_data["balance_sheets"].empty and "symbol" in bulk_data["balance_sheets"].columns:
+            logger.info(f"    Balance sheet symbols: {bulk_data['balance_sheets']['symbol'].unique().tolist()}")
         
         bulk_data["cash_flows"] = await client.fetch_cash_flow_bulk(
             symbols=symbols, period=args.financial_period
         )
+        cash_bulk_current = await client.fetch_cash_flow_bulk_by_year(
+            year=current_year,
+            period=args.financial_period,
+            symbols=symbols,
+        )
+        cash_bulk_prev = await client.fetch_cash_flow_bulk_by_year(
+            year=current_year - 1,
+            period=args.financial_period,
+            symbols=symbols,
+        )
+        bulk_data["cash_flows"] = pd.concat(
+            [
+                _coalesce_duplicate_columns(bulk_data["cash_flows"]),
+                _coalesce_duplicate_columns(cash_bulk_current),
+                _coalesce_duplicate_columns(cash_bulk_prev),
+            ],
+            ignore_index=True,
+        ).drop_duplicates()
         logger.info(f"  Cash flows: {len(bulk_data['cash_flows'])} records")
+        if not bulk_data["cash_flows"].empty and "symbol" in bulk_data["cash_flows"].columns:
+            logger.info(f"    Cash flow symbols: {bulk_data['cash_flows']['symbol'].unique().tolist()}")
+
+        bulk_data["income_growth"] = await client.fetch_income_statement_growth_bulk_by_year(
+            year=current_year,
+            period=args.financial_period,
+            symbols=symbols,
+        )
+        logger.info(f"  Income growth bulk: {len(bulk_data['income_growth'])} records")
         
         # Step 3: Fetch prices
         logger.info("Step 3: Fetching prices...")
         bulk_data["prices"] = await client.fetch_bulk_daily_prices(symbols=symbols)
         logger.info(f"  Prices: {len(bulk_data['prices'])} records")
+
+        if args.fast_debug_pead:
+            bulk_data["price_history"] = pd.DataFrame()
+            bulk_data["technical_indicators"] = pd.DataFrame()
+            logger.info("  Fast mode: skipping price history and technical indicators")
+        else:
+            logger.info("  Step 3b: Fetching historical price EOD...")
+            bulk_data["price_history"] = await client.fetch_historical_price_eod_bulk(
+                symbols=symbols,
+                mode="full",
+                limit=500,
+            )
+            logger.info(f"  Price history: {len(bulk_data['price_history'])} records")
+
+            logger.info("  Step 3c: Fetching technical indicators (RSI/ADX)...")
+            technical_rsi = await client.fetch_technical_indicator_bulk(
+                indicator="rsi", symbols=symbols, period_length=14, timeframe="1day", limit=300
+            )
+            technical_adx = await client.fetch_technical_indicator_bulk(
+                indicator="adx", symbols=symbols, period_length=14, timeframe="1day", limit=300
+            )
+            bulk_data["technical_indicators"] = pd.concat([technical_rsi, technical_adx], ignore_index=True).drop_duplicates()
+            logger.info(f"  Technical indicators: {len(bulk_data['technical_indicators'])} records")
         
         # Step 4: Fetch analyst estimates (now with historical time series)
         logger.info("Step 4: Fetching analyst estimates (current + historical)...")
@@ -330,23 +491,104 @@ async def run_fmp_ranker(args):
             symbols=symbols, period=args.financial_period, historical_limit=20
         )
         logger.info(f"  Analyst estimates: {len(bulk_data['analyst_estimates'])} records")
+
+        logger.info("  Step 4b: Fetching financial estimates...")
+        financial_estimates_df = await client.fetch_financial_estimates_bulk(
+            symbols=symbols, period="quarterly", historical_limit=20
+        )
+        if not financial_estimates_df.empty:
+            bulk_data["analyst_estimates"] = (
+                pd.concat([bulk_data["analyst_estimates"], financial_estimates_df], ignore_index=True)
+                .drop_duplicates()
+            )
+        logger.info(f"  Financial estimates: {len(financial_estimates_df)} records")
+        logger.info(f"  Combined estimate history: {len(bulk_data['analyst_estimates'])} records")
         
         # Step 5: Fetch Earnings Surprises (BULK)
         # Fetch current and previous year to ensure we have context
-        logger.info("Step 5: Fetching bulk earnings surprises (2025-2026)...")
-        surprises_2026 = await client.fetch_earnings_surprises_bulk(year=2026)
-        surprises_2025 = await client.fetch_earnings_surprises_bulk(year=2025)
-        bulk_data["earnings_surprises"] = pd.concat([surprises_2026, surprises_2025]).drop_duplicates()
-        logger.info(f"  Earnings surprises: {len(bulk_data['earnings_surprises'])} records")
+        if not args.fast_debug_pead:
+            bulk_data["earnings_surprises"], _ = await fetch_earnings_surprises_bundle()
         
         # Step 6: Fetch insider trading (bulk, not per-symbol)
-        logger.info("Step 6: Fetching insider trading...")
-        bulk_data["insider_trading"] = await client.fetch_insider_trading_bulk(page=0, limit=500)
-        logger.info(f"  Insider trading: {len(bulk_data['insider_trading'])} records")
+        if args.fast_debug_pead:
+            bulk_data["insider_trading"] = pd.DataFrame()
+            bulk_data["insider_statistics"] = pd.DataFrame()
+            bulk_data["employee_count"] = pd.DataFrame()
+            logger.info("Step 6: Fast mode skipping insider/employee endpoints")
+        else:
+            logger.info("Step 6: Fetching insider trading...")
+            bulk_data["insider_trading"] = await client.fetch_insider_trading_bulk(page=0, limit=500)
+            logger.info(f"  Insider trading: {len(bulk_data['insider_trading'])} records")
+
+            logger.info("  Step 6b: Fetching insider trading statistics...")
+            bulk_data["insider_statistics"] = await client.fetch_insider_trading_statistics_bulk(
+                symbols=symbols,
+                limit=500,
+            )
+            logger.info(f"  Insider statistics: {len(bulk_data['insider_statistics'])} records")
+
+            logger.info("  Step 6d: Fetching insider search trades...")
+            insider_search_df = await client.fetch_search_insider_trades_bulk(symbols=symbols, limit=500)
+            if not insider_search_df.empty:
+                bulk_data["insider_trading"] = pd.concat(
+                    [bulk_data["insider_trading"], insider_search_df],
+                    ignore_index=True,
+                ).drop_duplicates()
+            logger.info(f"  Insider search trades: {len(insider_search_df)} records")
+
+            logger.info("  Step 6c: Fetching employee counts...")
+            bulk_data["employee_count"] = await client.fetch_employee_count_bulk(
+                symbols=symbols,
+                limit=500,
+            )
+            employee_hist_df = await client.fetch_historical_employee_count_bulk(symbols=symbols, limit=500)
+            if not employee_hist_df.empty:
+                bulk_data["employee_count"] = pd.concat(
+                    [bulk_data["employee_count"], employee_hist_df],
+                    ignore_index=True,
+                ).drop_duplicates()
+            logger.info(f"  Employee count: {len(bulk_data['employee_count'])} records")
         
-        # Step 7: Institutional ownership (currently unavailable on FMP stable API)
-        logger.info("Step 7: Institutional ownership (degraded - endpoint unavailable)")
-        bulk_data["institutional_ownership"] = pd.DataFrame()
+        # Step 7: Institutional ownership (try recent quarter fallbacks)
+        if args.fast_debug_pead:
+            bulk_data["institutional_ownership"] = pd.DataFrame()
+            bulk_data["scores"] = pd.DataFrame()
+            bulk_data["peers"] = pd.DataFrame()
+            logger.info("Step 7/8: Fast mode skipping institutional, scores, and peers")
+        else:
+            logger.info("Step 7: Fetching institutional ownership...")
+            institutional_df = pd.DataFrame()
+            inst_attempts = [(2024, 4), (2024, 3), (2023, 4)]
+            for year, quarter in inst_attempts:
+                logger.info(f"  Trying institutional ownership for {year} Q{quarter}...")
+                institutional_df = await client.fetch_institutional_ownership_bulk(
+                    symbols=symbols,
+                    year=year,
+                    quarter=quarter,
+                )
+                if not institutional_df.empty:
+                    logger.info(f"  Institutional ownership: {len(institutional_df)} records ({year} Q{quarter})")
+                    break
+
+            if institutional_df.empty:
+                logger.info("  Institutional ownership unavailable for tested quarters; continuing gracefully")
+
+            bulk_data["institutional_ownership"] = institutional_df
+
+            logger.info("Step 8: Fetching positions summary and scores/peers...")
+            positions_summary_df = await client.fetch_positions_summary_bulk(symbols=symbols, limit=500)
+            if not positions_summary_df.empty:
+                bulk_data["institutional_ownership"] = pd.concat(
+                    [bulk_data["institutional_ownership"], positions_summary_df],
+                    ignore_index=True,
+                ).drop_duplicates()
+            bulk_data["scores"] = await client.fetch_scores_bulk(symbols=symbols)
+            bulk_data["peers"] = await client.fetch_peers_bulk()
+            if bulk_data["peers"].empty:
+                bulk_data["peers"] = await client.fetch_peers_for_symbols(symbols=symbols, limit=500)
+            logger.info(f"  Positions summary: {len(positions_summary_df)} records")
+            logger.info(f"  Scores bulk: {len(bulk_data['scores'])} records")
+            logger.info(f"  Peers: {len(bulk_data['peers'])} records")
         
         logger.info("Bulk data fetch completed")
 
@@ -368,8 +610,17 @@ async def run_fmp_ranker(args):
         historical_estimates_df=bulk_data["analyst_estimates"],
         surprises_df=bulk_data["earnings_surprises"]
     )
+
+    if args.symbols and not raw_df.empty and "symbol" in raw_df.columns:
+        requested_symbols = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        before_count = len(raw_df)
+        raw_df = raw_df[raw_df["symbol"].astype(str).str.upper().isin(requested_symbols)].copy()
+        logger.info(f"Applied --symbols filter after mapping: {before_count} -> {len(raw_df)} rows")
     
     logger.info(f"Raw DataFrame: {len(raw_df)} symbols, {len(raw_df.columns)} columns")
+
+    if args.trace_sparsity:
+        trace_sparsity(raw_df, bulk_data, sample_size=args.trace_sample_size)
     
     if raw_df.empty:
         logger.error("No data available after mapping. Exiting.")
@@ -475,6 +726,83 @@ def verify_ranking(ranked_df: pd.DataFrame, raw_df: pd.DataFrame):
         logger.warning(f"  ⚠ rank column missing")
     
     logger.info("Verification checks completed")
+
+
+def trace_sparsity(raw_df: pd.DataFrame, bulk_data: dict[str, pd.DataFrame], sample_size: int = 10):
+    """Log where sparse feature families lose coverage: payload, symbol-level, and merged non-null."""
+    logger.info("Sparsity Trace (raw -> merged):")
+
+    family_specs = {
+        "revision": {
+            "bulk_key": "analyst_estimates",
+            "raw_cols": ["revision_impulse_signal", "revision_jerk_signal", "estimate_term_structure_signal"],
+        },
+        "earnings": {
+            "bulk_key": "earnings_surprises",
+            "raw_cols": ["pead_signal", "sue_signal", "earnings_momentum_signal"],
+        },
+        "momentum": {
+            "bulk_key": "prices",
+            "raw_cols": ["price_momentum_6m_ex_1m", "price_momentum_effective_signal", "price_momentum_has_coverage"],
+        },
+        "forensic": {
+            "bulk_key": "income_statements",
+            "raw_cols": ["beneish_m_score", "accrual_volatility", "working_capital_stress_penalty"],
+        },
+        "employee": {
+            "bulk_key": "employee_count",
+            "raw_cols": ["full_time_employees", "revenue_per_employee", "gross_profit_per_employee"],
+        },
+        "institutional": {
+            "bulk_key": "institutional_ownership",
+            "raw_cols": ["percent_institutions", "institution_holder_count_latest", "institutional_ownership_delta"],
+        },
+        "insider": {
+            "bulk_key": "insider_statistics",
+            "raw_cols": ["insider_conviction_trade_count", "insider_conviction_buy_person_count", "insider_conviction_sell_person_count"],
+        },
+    }
+
+    for family, spec in family_specs.items():
+        bulk_df = bulk_data.get(spec["bulk_key"], pd.DataFrame())
+        payload_rows = len(bulk_df)
+        payload_symbols = bulk_df["symbol"].nunique() if (not bulk_df.empty and "symbol" in bulk_df.columns) else 0
+        logger.info(f"  [{family}] payload rows={payload_rows}, symbols={payload_symbols}")
+        for col in spec["raw_cols"]:
+            if col in raw_df.columns:
+                nn = int(raw_df[col].notna().sum())
+                logger.info(f"    merged {col}: {nn}/{len(raw_df)} non-null")
+            else:
+                logger.info(f"    merged {col}: MISSING_COLUMN")
+
+    if raw_df.empty or "symbol" not in raw_df.columns:
+        return
+
+    sample_n = max(1, int(sample_size))
+    sample_symbols = raw_df["symbol"].dropna().astype(str).head(sample_n).tolist()
+    probe_cols = [
+        "revision_impulse_signal",
+        "revision_jerk_signal",
+        "estimate_term_structure_signal",
+        "revenue_growth_yoy",
+        "revenue_acceleration",
+        "price_momentum_6m_ex_1m",
+        "price_momentum_effective_signal",
+        "beneish_m_score",
+        "accrual_volatility",
+        "working_capital_stress_penalty",
+        "insider_conviction_trade_count",
+        "full_time_employees",
+    ]
+    available_probe_cols = [c for c in probe_cols if c in raw_df.columns]
+    if not available_probe_cols:
+        return
+
+    sample_df = raw_df[raw_df["symbol"].astype(str).isin(sample_symbols)][["symbol"] + available_probe_cols].copy()
+    for col in available_probe_cols:
+        sample_df[col] = sample_df[col].notna().astype(int)
+    logger.info("  Sample symbol non-null flags (1=present, 0=missing):")
+    logger.info("\n%s", sample_df.to_string(index=False))
 
 
 def main():

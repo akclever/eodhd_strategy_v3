@@ -9,7 +9,7 @@ from .client import EODHDClient
 
 logger = logging.getLogger(__name__)
 
-ProviderMode = Literal["eodhd", "alpha_vantage", "hybrid"]
+ProviderMode = Literal["eodhd", "alpha_vantage", "hybrid", "fmp"]
 
 
 class DataProvider:
@@ -32,11 +32,13 @@ class DataProvider:
         eodhd_client: Optional[EODHDClient] = None,
         av_client: Optional["AlphaVantageClient"] = None,  # noqa: F821 – lazy import
         edgar_client: Optional["SECEdgarClient"] = None,  # noqa: F821 – lazy import
+        fmp_client: Optional["FMPClient"] = None,  # noqa: F821 – lazy import
     ):
         self.mode = mode
         self.eodhd = eodhd_client
         self.av = av_client
         self.edgar = edgar_client
+        self.fmp = fmp_client
 
         if mode == "eodhd" and eodhd_client is None:
             raise ValueError("eodhd mode requires an EODHDClient")
@@ -44,6 +46,8 @@ class DataProvider:
             raise ValueError("alpha_vantage mode requires an AlphaVantageClient")
         if mode == "hybrid" and (eodhd_client is None or av_client is None):
             raise ValueError("hybrid mode requires both EODHDClient and AlphaVantageClient")
+        if mode == "fmp" and fmp_client is None:
+            raise ValueError("fmp mode requires an FMPClient")
 
     # ------------------------------------------------------------------
     # Pass-through helpers (keep API-surface compatible with EODHDClient)
@@ -61,6 +65,8 @@ class DataProvider:
             return self.eodhd.cache_dir
         if self.av is not None:
             return self.av.cache_dir.parent  # av stores in cache_dir/alpha_vantage
+        if self.fmp is not None:
+            return self.fmp.config.cache_dir
         raise RuntimeError("No client available for cache_dir")
 
     @property
